@@ -140,13 +140,6 @@ test('deterministic picking hits expected indices (webgl)', async ({ page }) => 
   await expectDeterministicPick(page, 'webgl');
 });
 
-test('deterministic picking hits expected indices (webgpu when available)', async ({ page }) => {
-  await page.goto('/');
-  const supported = await page.evaluate(async () => {
-    if (!navigator.gpu) return false;
-    const adapter = await navigator.gpu.requestAdapter();
-    return Boolean(adapter);
-  });
-  test.skip(!supported, 'WebGPU not available in browser');
+test('@webgpu deterministic picking hits expected indices (webgpu)', async ({ page }) => {
   await expectDeterministicPick(page, 'webgpu');
 });

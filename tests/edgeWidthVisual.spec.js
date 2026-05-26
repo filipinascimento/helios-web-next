@@ -1,10 +1,11 @@
 import { test, expect } from '@playwright/test';
+import { PNG } from 'pngjs';
 
 test('edges render with correct relative widths', async ({ page }, testInfo) => {
-  await page.goto('/');
+  await page.goto('/tests/fixtures/blank.html');
   await page.setViewportSize({ width: 400, height: 300 });
 
-  const setup = await page.evaluate(async () => {
+  await page.evaluate(async () => {
     if (window.__helios) {
       window.__helios.destroy();
     }
@@ -12,11 +13,12 @@ test('edges render with correct relative widths', async ({ page }, testInfo) => 
     const { createDeterministicHelios } = await import('/src/tests/deterministicNetwork.js');
     const { helios } = await createDeterministicHelios(document.getElementById('app'), 'webgl');
     const network = helios.network;
-    const edges = network.addEdges([
-      { from: 0, to: 1 },
-      { from: 2, to: 3 },
-    ]);
+    let edges = [];
     network.withBufferAccess(() => {
+      edges = Array.from(network.edgeIndices ?? []).slice(0, 2);
+      if (edges.length < 2) {
+        throw new Error(`Expected deterministic fixture to expose 2 edges, received ${edges.length}`);
+      }
       const positions = network.getNodeAttributeBuffer('_helios_visuals_position')?.view;
       const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color')?.view;
       const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width')?.view;
@@ -47,12 +49,12 @@ test('edges render with correct relative widths', async ({ page }, testInfo) => 
         widths[offset] = value;
         widths[offset + 1] = value;
       };
-      writeColor(edges[0], [1, 0, 0, 1]);
+      writeColor(edges[0], [0, 0.25, 1, 1]);
       writeWidth(edges[0], 1);
-      writeColor(edges[1], [0, 0.25, 1, 1]);
-      writeWidth(edges[1], 10);
+      writeColor(edges[1], [0, 0, 0, 0]);
+      writeWidth(edges[1], 1);
       opacities.set([1, 1], edges[0] * 2);
-      opacities.set([1, 1], edges[1] * 2);
+      opacities.set([0, 0], edges[1] * 2);
       window.__edgeColorSample = {
         edge0: Array.from(colors.slice(edges[0] * 8, edges[0] * 8 + 8)),
         edge1: Array.from(colors.slice(edges[1] * 8, edges[1] * 8 + 8)),
@@ -76,11 +78,8 @@ test('edges render with correct relative widths', async ({ page }, testInfo) => 
       '_helios_visuals_edge_opacity',
     );
     helios.visuals.markPositionsDirty();
-    helios.visuals.markAllDenseDirty();
     helios.scheduler.requestGeometry();
-    window.__edgeIds = Array.from(edges);
     window.__helios = helios;
-    return { edges: Array.from(edges), samples: window.__edgeColorSample };
   });
 
   await page.waitForFunction(() => {
@@ -91,7 +90,7 @@ test('edges render with correct relative widths', async ({ page }, testInfo) => 
   }, { timeout: 5000 });
   await page.waitForTimeout(150);
 
-  const metrics = await page.evaluate(async () => {
+  const measureBlueCoverage = async () => page.evaluate(async () => {
     const helios = window.__helios;
     if (!helios) throw new Error('Helios instance missing');
     const renderer = helios.renderer;
@@ -112,103 +111,184 @@ test('edges render with correct relative widths', async ({ page }, testInfo) => 
     const { width, height } = renderer.size ?? { width: 0, height: 0 };
     const rect = { x: 0, y: 0, width, height };
     const data = await Promise.resolve(renderer.readPixels(null, rect));
-    const denseColors = (() => {
-      try {
-        return Array.from(helios.network.getDenseEdgeAttributeView('_helios_visuals_edge_color')?.view?.slice(0, 16) ?? []);
-      } catch (_) {
-        return null;
-      }
-    })();
-    const denseWidths = (() => {
-      try {
-        return Array.from(helios.network.getDenseEdgeAttributeView('_helios_visuals_edge_width')?.view?.slice(0, 8) ?? []);
-      } catch (_) {
-        return null;
-      }
-    })();
-    const denseSegments = (() => {
-      try {
-        return Array.from(
-          helios.network.getDenseEdgeAttributeView('_helios_visuals_edge_endpoints_position')?.view?.slice(0, 24) ?? [],
-        );
-      } catch (_) {
-        return null;
-      }
-    })();
-    let denseEdgeCount = 0;
-    helios.network.updateDenseEdgeIndexBuffer();
-    helios.network.withBufferAccess(() => {
-      denseEdgeCount = helios.network.getDenseEdgeIndexView()?.count ?? 0;
-    });
-    if (!data || !width || !height) {
-      return {
-        width,
-        height,
-        hasData: !!data,
-        nonWhite: 0,
-        redCount: 0,
-        blueCount: 0,
-        redMax: 0,
-        blueMax: 0,
-        edgeIds: window.__edgeIds ?? [],
-        denseEdgeCount,
-        samples: window.__edgeColorSample ?? null,
-        dataLength: data ? data.length : 0,
-      };
-    }
-    let redCount = 0;
+    if (!data || !width || !height) return { width, height, hasData: !!data, blueCount: 0 };
     let blueCount = 0;
-    let nonWhite = 0;
-    let redMax = 0;
-    let blueMax = 0;
-    const dataLength = data.length;
     for (let i = 0; i < data.length; i += 4) {
       const r = data[i];
       const g = data[i + 1];
       const b = data[i + 2];
-      if (r || g || b) nonWhite += 1;
-      if (r > g + b + 10 && r > 20) redCount += 1;
       if (b > r + g + 10 && b > 40) blueCount += 1;
-      redMax = Math.max(redMax, r);
-      blueMax = Math.max(blueMax, b);
     }
-    return {
-      width,
-      height,
-      hasData: !!data,
-      nonWhite,
-      redCount,
-      blueCount,
-      redMax,
-      blueMax,
-      edgeIds: window.__edgeIds ?? [],
-      denseEdgeCount,
-      samples: window.__edgeColorSample ?? null,
-      dataLength,
-      edgeCount: renderer.graphLayer?.edgeCount ?? null,
-      denseColors,
-      denseWidths,
-      denseSegments,
-      schedulerState: {
-        running: helios.scheduler?.running ?? null,
-        needsRender: helios.scheduler?._needsRender ?? null,
-        needsGeometry: helios.scheduler?._needsGeometry ?? null,
-      },
-    };
+    return { width, height, hasData: !!data, blueCount };
   });
+
+  await page.evaluate(() => {
+    const helios = window.__helios;
+    const network = helios?.network;
+    if (!helios || !network) throw new Error('Helios instance missing');
+    network.withBufferAccess(() => {
+      const edges = Array.from(network.edgeIndices ?? []).slice(0, 2);
+      const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width')?.view;
+      if (!widths || edges.length < 1) throw new Error('Edge width buffer unavailable');
+      widths[edges[0] * 2] = 1;
+      widths[edges[0] * 2 + 1] = 1;
+    });
+    helios.visuals.bumpEdgeAttributes('_helios_visuals_edge_width');
+    helios.scheduler.requestGeometry();
+  });
+  const narrowMetrics = await measureBlueCoverage();
+
+  await page.evaluate(() => {
+    const helios = window.__helios;
+    const network = helios?.network;
+    if (!helios || !network) throw new Error('Helios instance missing');
+    network.withBufferAccess(() => {
+      const edges = Array.from(network.edgeIndices ?? []).slice(0, 2);
+      const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width')?.view;
+      if (!widths || edges.length < 1) throw new Error('Edge width buffer unavailable');
+      widths[edges[0] * 2] = 10;
+      widths[edges[0] * 2 + 1] = 10;
+    });
+    helios.visuals.bumpEdgeAttributes('_helios_visuals_edge_width');
+    helios.scheduler.requestGeometry();
+  });
+  const wideMetrics = await measureBlueCoverage();
 
   await testInfo.attach('edge-width-metrics', {
-    body: JSON.stringify({ ...metrics, edges: setup.edges, samples: setup.samples }, null, 2),
+    body: JSON.stringify({ narrow: narrowMetrics, wide: wideMetrics }, null, 2),
     contentType: 'application/json',
   });
-  // eslint-disable-next-line no-console
-  console.log('edge-width-metrics', metrics);
 
-  expect(metrics.hasData).toBeTruthy();
-  expect(metrics.width).toBeGreaterThan(0);
-  expect(metrics.height).toBeGreaterThan(0);
-  expect(metrics.nonWhite).toBeGreaterThan(0);
-  expect(metrics.redCount).toBeGreaterThan(0);
-  expect(metrics.blueCount).toBeGreaterThan(0);
-  expect(metrics.blueCount).toBeGreaterThan(metrics.redCount * 1.4);
+  expect(narrowMetrics.hasData).toBeTruthy();
+  expect(narrowMetrics.width).toBeGreaterThan(0);
+  expect(narrowMetrics.height).toBeGreaterThan(0);
+  expect(narrowMetrics.blueCount).toBeGreaterThan(0);
+  expect(wideMetrics.blueCount).toBeGreaterThan(narrowMetrics.blueCount * 1.8);
+});
+
+test('supersampling does not change apparent edge width', async ({ page }, testInfo) => {
+  await page.goto('/tests/fixtures/blank.html');
+  await page.setViewportSize({ width: 400, height: 300 });
+
+  await page.evaluate(async () => {
+    if (window.__helios) {
+      window.__helios.destroy();
+    }
+    document.body.innerHTML = '<div id="app" style="width:400px;height:300px;"></div>';
+    const { createDeterministicHelios } = await import('/src/tests/deterministicNetwork.js');
+    const { helios } = await createDeterministicHelios(document.getElementById('app'), 'webgl');
+    const network = helios.network;
+    let edgeId = -1;
+    let secondaryEdgeId = -1;
+    network.withBufferAccess(() => {
+      const edges = Array.from(network.edgeIndices ?? []).slice(0, 2);
+      if (edges.length < 1) {
+        throw new Error(`Expected deterministic fixture to expose at least 1 edge, received ${edges.length}`);
+      }
+      edgeId = edges[0];
+      secondaryEdgeId = edges[1] ?? -1;
+      const positions = network.getNodeAttributeBuffer('_helios_visuals_position')?.view;
+      const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color')?.view;
+      const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width')?.view;
+      const opacities = network.getEdgeAttributeBuffer('_helios_visuals_edge_opacity')?.view;
+      if (!positions || !colors || !widths || !opacities) {
+        throw new Error('Buffers unavailable for position/color/width/opacity');
+      }
+      positions.set([
+        -90, 0, 0,
+        90, 0, 0,
+        -90, 80, 0,
+        90, 80, 0,
+      ]);
+      colors.set([0, 0.35, 1, 1, 0, 0.35, 1, 1], edgeId * 8);
+      widths.set([16, 16], edgeId * 2);
+      opacities.set([1, 1], edgeId * 2);
+      if (secondaryEdgeId >= 0) {
+        colors.set([0, 0, 0, 0, 0, 0, 0, 0], secondaryEdgeId * 8);
+        widths.set([1, 1], secondaryEdgeId * 2);
+        opacities.set([0, 0], secondaryEdgeId * 2);
+      }
+    });
+    helios.renderer.setEdgeRenderingMode?.('quad');
+    helios.renderer.setEdgeTransparencyMode?.('alpha');
+    helios.renderer.graphLayer.edgeWidthBase = 0;
+    helios.renderer.graphLayer.edgeWidthScale = 1;
+    helios.renderer.graphLayer.nodeOpacityBase = 0;
+    helios.renderer.graphLayer.nodeOpacityScale = 0;
+    helios.renderer.graphLayer.edgeOpacityBase = 0;
+    helios.renderer.graphLayer.edgeOpacityScale = 1;
+    helios.visuals.bumpEdgeAttributes(
+      '_helios_visuals_edge_color',
+      '_helios_visuals_edge_width',
+      '_helios_visuals_edge_opacity',
+    );
+    helios.visuals.markPositionsDirty();
+    helios.scheduler.requestGeometry();
+    window.__helios = helios;
+  });
+
+  const settleRender = async (mode) => {
+    await page.evaluate((nextMode) => {
+      const helios = window.__helios;
+      if (!helios) throw new Error('Helios instance missing');
+      helios.supersampling(nextMode);
+      helios.scheduler?.requestGeometry?.();
+      helios.scheduler?.requestRender?.();
+    }, mode);
+    await page.waitForFunction((nextMode) => {
+      const helios = window.__helios;
+      const expectedRatio = nextMode === '2x' ? 2 : 1;
+      return helios?.layers?.size?.devicePixelRatio === expectedRatio
+        && helios.scheduler?._needsGeometry === false
+        && helios.scheduler?._needsRender === false;
+    }, mode, { timeout: 5_000 });
+    await page.waitForTimeout(100);
+  };
+
+  const readBlueCoverage = async () => {
+    const box = await page.locator('#app canvas').boundingBox();
+    if (!box) throw new Error('Canvas unavailable for screenshot coverage');
+    const image = await page.screenshot({
+      clip: {
+        x: Math.floor(box.x),
+        y: Math.floor(box.y),
+        width: Math.floor(box.width),
+        height: Math.floor(box.height),
+      },
+    });
+    const png = PNG.sync.read(image);
+    let blueCount = 0;
+    for (let i = 0; i < png.data.length; i += 4) {
+      const r = png.data[i];
+      const g = png.data[i + 1];
+      const b = png.data[i + 2];
+      if (b > r + g + 10 && b > 30) blueCount += 1;
+    }
+    const pixelCount = Math.max(1, png.width * png.height);
+    return {
+      blueCount,
+      width: png.width,
+      height: png.height,
+      blueRatio: blueCount / pixelCount,
+    };
+  };
+
+  await settleRender('off');
+  const offMetrics = await readBlueCoverage();
+
+  await settleRender('2x');
+  const twoXMetrics = await readBlueCoverage();
+
+  await testInfo.attach('edge-width-supersampling-metrics', {
+    body: JSON.stringify({ off: offMetrics, twoX: twoXMetrics }, null, 2),
+    contentType: 'application/json',
+  });
+
+  expect(offMetrics.width).toBeGreaterThan(0);
+  expect(offMetrics.height).toBeGreaterThan(0);
+  expect(offMetrics.blueCount).toBeGreaterThan(0);
+  expect(twoXMetrics.blueCount).toBeGreaterThan(0);
+  const ratio = twoXMetrics.blueRatio / offMetrics.blueRatio;
+  expect(ratio).toBeGreaterThan(0.7);
+  expect(ratio).toBeLessThan(1.2);
 });

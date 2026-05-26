@@ -1,5 +1,5 @@
 import { AttributeType } from 'helios-network';
-import { createColormapScale } from '../colors/colormaps.js';
+import { DEFAULT_NODE_COLORMAP, createColormapScale } from '../colors/colormaps.js';
 import { VISUAL_ATTRIBUTE_NAMES, DEFAULT_VISUALS, VISUAL_ATTRIBUTE_MAP } from './constants.js';
 
 const {
@@ -16,6 +16,8 @@ const {
 } = VISUAL_ATTRIBUTE_NAMES;
 
 const { DEFAULT_NODE_OUTLINE_COLOR, DEFAULT_NODE_OUTLINE_WIDTH, DEFAULT_NODE_SIZE } = DEFAULT_VISUALS;
+const INDEX_ATTRIBUTE = '$index';
+const DEFAULT_CATEGORICAL_COLOR = '#888888ff';
 
 function validateAttribute(buffer, name, expectedType, expectedDimension) {
   if (!buffer) {
@@ -28,6 +30,22 @@ function validateAttribute(buffer, name, expectedType, expectedDimension) {
   }
   if (buffer.type != null && expectedType != null && buffer.type !== expectedType) {
     throw new Error(`Attribute ${name} has type ${buffer.type}, expected ${expectedType}`);
+  }
+}
+
+function resolveAttributeMetadata(network, scope, name) {
+  if (!network || !name) return null;
+  const internalMap = scope === 'node' ? network._nodeAttributes : network._edgeAttributes;
+  const cached = internalMap?.get?.(name) ?? null;
+  if (cached) return cached;
+  const infoGetter = scope === 'node' ? 'getNodeAttributeInfo' : 'getEdgeAttributeInfo';
+  const info = network[infoGetter]?.(name) ?? null;
+  if (info) return info;
+  const bufferGetter = scope === 'node' ? 'getNodeAttributeBuffer' : 'getEdgeAttributeBuffer';
+  try {
+    return network[bufferGetter]?.(name) ?? null;
+  } catch (_) {
+    return null;
   }
 }
 
@@ -93,6 +111,14 @@ function normalizeAttributeName(name) {
   const trimmed = name.replace(/^@nodes?\./, '');
   return VISUAL_ATTRIBUTE_MAP[trimmed] ?? trimmed;
 }
+
+const NODE_ATTRIBUTE_TO_CHANNEL = {
+  [NODE_COLOR_ATTRIBUTE]: 'color',
+  [NODE_SIZE_ATTRIBUTE]: 'size',
+  [NODE_OUTLINE_WIDTH_ATTRIBUTE]: 'outline',
+  [NODE_OUTLINE_COLOR_ATTRIBUTE]: 'outlineColor',
+  [NODE_POSITION_ATTRIBUTE]: 'position',
+};
 
 function computePassthroughTargetDimension(sourceDimension = 1, endpoints = 'both', doubleWidth = true) {
   const base = Math.max(1, sourceDimension || 1);
@@ -179,18 +205,118 @@ function categoricalScale(value, domain = [], range = []) {
   return range[index % range.length];
 }
 
+function applyBuiltinTransform(transformType, value, power = 1) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return value;
+  if (!transformType || transformType === 'linear') return v;
+
+  if (transformType === 'log') {
+    if (v <= 0) return undefined;
+    return Math.log(v);
+  }
+
+  if (transformType === 'log1p') {
+    if (v <= -1) return undefined;
+    return Math.log1p(v);
+  }
+
+  if (transformType === 'logit') {
+    // Avoid infinities for values near 0/1.
+    const eps = 1e-12;
+    const clamped = Math.max(eps, Math.min(1 - eps, v));
+    return Math.log(clamped / (1 - clamped));
+  }
+
+  if (transformType === 'power') {
+    const p = Number(power);
+    if (!Number.isFinite(p)) return undefined;
+    const out = Math.pow(v, p);
+    return Number.isFinite(out) ? out : undefined;
+  }
+
+  return v;
+}
+
+function isPercentileTransformType(transformType) {
+  return transformType === 'percentile' || transformType === 'quantile';
+}
+
+function applyPercentileTransform(config, inputs) {
+  const value = Array.isArray(inputs) ? (inputs.length === 1 ? inputs[0] : undefined) : inputs;
+  const v = Number(value);
+  if (!Number.isFinite(v)) return undefined;
+  const lookup = config?.__percentileLookup;
+  if (typeof lookup !== 'function') return v;
+  return lookup(v);
+}
+
+function clampForDomainTransform(transformType, value) {
+  const v = Number(value);
+  if (!Number.isFinite(v)) return value;
+  const eps = 1e-12;
+  if (!transformType || transformType === 'linear') return v;
+  if (transformType === 'log') return Math.max(eps, v);
+  if (transformType === 'log1p') return Math.max(-1 + eps, v);
+  if (transformType === 'logit') return Math.max(eps, Math.min(1 - eps, v));
+  return v;
+}
+
+function transformDomainIfNeeded(config, domain) {
+  const type = config?.transformType;
+  if (!type || type === 'linear') return domain;
+  if (isPercentileTransformType(type)) return domain;
+  if (!Array.isArray(domain) || domain.length !== 2) return domain;
+  const power = config?.transformPower;
+  const d0 = clampForDomainTransform(type, domain[0]);
+  const d1 = clampForDomainTransform(type, domain[1]);
+  const t0 = applyBuiltinTransform(type, d0, power);
+  const t1 = applyBuiltinTransform(type, d1, power);
+  if (!Number.isFinite(t0) || !Number.isFinite(t1)) return domain;
+  return [t0, t1];
+}
+
+function resolveTransformFn(config) {
+  const type = config?.transformType;
+  if (!type || type === 'linear') return undefined;
+  if (isPercentileTransformType(type)) {
+    return (inputs) => applyPercentileTransform(config, inputs);
+  }
+  const power = config?.transformPower;
+  return (inputs) => applyBuiltinTransform(type, inputs, power);
+}
+
 function applyScale(config, value, inputs, item, context) {
   if (config.type === 'colormap' || config.colormap) {
-    const scale = config.__colormapScale ?? createColormapScale(config.colormap ?? config.scale ?? config.range, {
-      domain: config.domain,
-      alpha: config.alpha,
-      clamp: config.clamp ?? true,
+    const baseDomain = resolveDivergentDomain(config, config.domain);
+    const domain = transformDomainIfNeeded(config, baseDomain);
+    const clamp = config.clamp ?? true;
+    if (!Number.isFinite(Number(value))) return undefined;
+    const scaleKey = config.colormap ?? config.scale ?? config.range;
+    const scaleSignature = JSON.stringify({
+      key: scaleKey,
+      domain: Array.isArray(domain) ? domain : null,
+      alpha: config.alpha ?? null,
+      clamp,
     });
-    config.__colormapScale = scale;
+    if (config.__colormapScaleSignature !== scaleSignature) {
+      config.__colormapScale = createColormapScale(scaleKey, { domain, alpha: config.alpha, clamp });
+      config.__colormapScaleSignature = scaleSignature;
+    }
+    const scale = config.__colormapScale;
+    if (typeof scale === 'function' && Array.isArray(domain) && domain.length === 2) {
+      const [d0, d1] = domain;
+      const lo = Math.min(d0, d1);
+      const hi = Math.max(d0, d1);
+      const clampMin = typeof clamp === 'object' ? clamp.min !== false : clamp !== false;
+      const clampMax = typeof clamp === 'object' ? clamp.max !== false : clamp !== false;
+      if (!clampMin && Number.isFinite(lo) && value < lo) return undefined;
+      if (!clampMax && Number.isFinite(hi) && value > hi) return undefined;
+    }
     return scale(value, inputs, item, context);
   }
   if (config.type === 'linear') {
-    return linearScale(value, config.domain, config.range);
+    const domain = transformDomainIfNeeded(config, config.domain);
+    return linearScale(value, domain, config.range);
   }
   if (config.type === 'categorical') {
     return categoricalScale(value, config.domain, config.range);
@@ -199,6 +325,90 @@ function applyScale(config, value, inputs, item, context) {
     return config.scale(value, inputs, item, context);
   }
   return value;
+}
+
+function resolveDivergentDomain(config, domain) {
+  if (!config?.divergent || isPercentileTransformType(config.transformType)) return domain;
+  if (!Array.isArray(domain) || domain.length !== 2) return [-1, 1];
+  const maxAbs = Math.max(Math.abs(domain[0] ?? 0), Math.abs(domain[1] ?? 0));
+  if (!Number.isFinite(maxAbs) || maxAbs === 0) return [-1, 1];
+  return [-maxAbs, maxAbs];
+}
+
+function buildPercentileLookup(values) {
+  if (!Array.isArray(values) || values.length === 0) return null;
+  const sorted = values.slice().sort((a, b) => a - b);
+  const denom = Math.max(1, sorted.length - 1);
+  return (value) => {
+    const v = Number(value);
+    if (!Number.isFinite(v)) return undefined;
+    let lo = 0;
+    let hi = sorted.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (sorted[mid] <= v) {
+        lo = mid + 1;
+      } else {
+        hi = mid;
+      }
+    }
+    const idx = Math.max(0, lo - 1);
+    return denom === 0 ? 0 : idx / denom;
+  };
+}
+
+function buildPercentileLookupForIndex(count) {
+  const size = Number(count);
+  if (!Number.isFinite(size) || size <= 0) return null;
+  const denom = Math.max(1, size - 1);
+  return (value) => {
+    const v = Number(value);
+    if (!Number.isFinite(v)) return undefined;
+    const idx = Math.max(0, Math.min(size - 1, Math.floor(v)));
+    return denom === 0 ? 0 : idx / denom;
+  };
+}
+
+function resolvePercentileLookup(mapper, config) {
+  const network = mapper?.network;
+  if (!network) return null;
+  const attrs = normalizeAttributes(config?.attributes);
+  if (attrs.length !== 1) return null;
+  const attr = attrs[0];
+  if (typeof attr !== 'string') return null;
+  if (attr === '$index') {
+    const count = mapper.mode === 'edge'
+      ? (network.edgeCount ?? network.edgesCount ?? null)
+      : (network.nodeCount ?? network.nodesCount ?? null);
+    return buildPercentileLookupForIndex(count);
+  }
+  const isNodeProxy = mapper.mode === 'edge' && (attr.startsWith('@node.') || attr.startsWith('@nodes.'));
+  const name = attr.replace(/^@nodes?\./, '');
+  const resolved = normalizeAttributeName(name);
+  const compute = () => {
+    try {
+      const indices = mapper.mode === 'edge' && !isNodeProxy ? network.edgeIndices : network.nodeIndices;
+      if (!indices || typeof indices.length !== 'number') return null;
+      const buffer = isNodeProxy
+        ? network.getNodeAttributeBuffer?.(resolved)
+        : (mapper.mode === 'edge' ? network.getEdgeAttributeBuffer?.(resolved) : network.getNodeAttributeBuffer?.(resolved));
+      if (!buffer?.view) return null;
+      if (Number.isFinite(buffer.dimension) && buffer.dimension !== 1) return null;
+      const values = [];
+      for (let i = 0; i < indices.length; i += 1) {
+        const idx = indices[i];
+        const v = Number(buffer.view[idx]);
+        if (Number.isFinite(v)) values.push(v);
+      }
+      return buildPercentileLookup(values);
+    } catch (_) {
+      return null;
+    }
+  };
+  if (typeof network.withBufferAccess === 'function') {
+    return network.withBufferAccess(compute);
+  }
+  return compute();
 }
 
 function buildNodeToEdgeValue(inputs) {
@@ -279,12 +489,16 @@ function computeChannelValue(config, item, context) {
 function normalizeChannelConfig(name, config) {
   const normalized = {
     name,
+    meta: config.meta && typeof config.meta === 'object' ? { ...config.meta } : undefined,
     attributes: config.attributes ?? config.from ?? undefined,
     transform: config.transform,
+    transformType: config.transformType,
+    transformPower: config.transformPower,
     type: config.type ?? config.mode ?? undefined,
     colormap: config.colormap,
     alpha: config.alpha,
     clamp: config.clamp,
+    divergent: config.divergent,
     endpoints: normalizeEndpoints(config.endpoints ?? config.endpoint ?? 'both'),
     nodeAttribute: config.nodeAttribute ?? config.nodeAttr ?? undefined,
     domain: config.domain,
@@ -294,6 +508,28 @@ function normalizeChannelConfig(name, config) {
     defaultValue: config.defaultValue,
     rules: (config.rules ?? []).map((rule) => ({ ...rule })),
   };
+
+  if ((normalized.type === 'colormap' || normalized.colormap) && normalized.defaultValue === undefined) {
+    const clamp = normalized.clamp;
+    const clampMin = clamp && typeof clamp === 'object' ? clamp.min !== false : clamp !== false;
+    const clampMax = clamp && typeof clamp === 'object' ? clamp.max !== false : clamp !== false;
+    if (!clampMin && !clampMax) {
+      normalized.defaultValue = DEFAULT_CATEGORICAL_COLOR;
+    }
+  }
+
+  if (
+    normalized.type === 'categorical'
+    && normalized.defaultValue === undefined
+    && (name === 'color' || name === 'outlineColor')
+  ) {
+    normalized.defaultValue = DEFAULT_CATEGORICAL_COLOR;
+  }
+
+  if (typeof normalized.transform !== 'function') {
+    const fn = resolveTransformFn(normalized);
+    if (typeof fn === 'function') normalized.transform = fn;
+  }
   if (normalized.type === 'constant' && normalized.value === undefined) {
     normalized.value = config.defaultValue;
   }
@@ -315,6 +551,111 @@ function normalizeChannelConfig(name, config) {
     normalized.range = undefined;
   }
   return normalized;
+}
+
+function isConstantChannel(config) {
+  return config?.type === 'constant' && (!config.rules || config.rules.length === 0);
+}
+
+function isEdgeNodePassthrough(config, def) {
+  return (
+    config &&
+    def?.nodeSource &&
+    (config.type === 'passthrough' || config.type === 'nodeToEdge' || config.type === 'nodeAttribute')
+  );
+}
+
+function resolveNodeChannelNameFromConfig(config, def) {
+  const attrs = normalizeAttributes(config?.attributes);
+  const hasAttributes = attrs.length > 0;
+  for (const attr of attrs) {
+    if (typeof attr !== 'string') continue;
+    if (!/^@nodes?\./.test(attr)) continue;
+    const normalized = normalizeAttributeName(attr);
+    const channelName = NODE_ATTRIBUTE_TO_CHANNEL[normalized];
+    if (channelName) return channelName;
+  }
+  if (config?.nodeAttribute) {
+    const normalized = normalizeAttributeName(config.nodeAttribute);
+    return NODE_ATTRIBUTE_TO_CHANNEL[normalized] ?? null;
+  }
+  if (!hasAttributes && def?.nodeSource) {
+    const normalized = normalizeAttributeName(def.nodeSource);
+    return NODE_ATTRIBUTE_TO_CHANNEL[normalized] ?? null;
+  }
+  return null;
+}
+
+function removeEdgeAttributeSafe(network, name, debug) {
+  if (!network?.removeEdgeAttribute || !name) return;
+  try {
+    network.removeEdgeAttribute(name);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : '';
+    if (/unknown edge attribute/i.test(msg) || /does not exist/i.test(msg) || /not defined/i.test(msg)) {
+      return;
+    }
+    debug?.log?.('mapper', 'Failed to remove edge attribute', { name, error });
+  }
+}
+
+function removeNodeToEdgeAttributeSafe(network, name, debug) {
+  if (!network?.removeNodeToEdgeAttribute || !name) return;
+  try {
+    network.removeNodeToEdgeAttribute(name);
+  } catch (error) {
+    debug?.log?.('mapper', 'Failed to remove node-to-edge attribute', { name, error });
+  }
+}
+
+function resolveEdgeChannelEntriesForNodeConstants(channelEntries, nodeMapper, network, debug) {
+  if (!channelEntries || !nodeMapper?.channels) return { entries: channelEntries, changed: false };
+  let changed = false;
+  for (const [name, config] of channelEntries.entries()) {
+    const def = CHANNEL_DEFS.edge?.[name];
+    if (!def || def.attribute === EDGE_ENDPOINTS_POSITION_ATTRIBUTE) continue;
+    if (!isEdgeNodePassthrough(config, def)) continue;
+    const nodeChannelName = resolveNodeChannelNameFromConfig(config, def);
+    if (!nodeChannelName) continue;
+    const nodeConfig = nodeMapper.channels.get(nodeChannelName);
+    if (!isConstantChannel(nodeConfig)) continue;
+    const constantValue = nodeConfig?.value ?? nodeConfig?.defaultValue;
+    if (constantValue === undefined) continue;
+    removeNodeToEdgeAttributeSafe(network, def.attribute, debug);
+    removeEdgeAttributeSafe(network, def.attribute, debug);
+    channelEntries.set(name, {
+      ...config,
+      type: 'constant',
+      value: constantValue,
+      attributes: undefined,
+      nodeAttribute: undefined,
+      endpoints: undefined,
+      transform: undefined,
+      scale: undefined,
+      domain: undefined,
+      range: undefined,
+      rules: [],
+    });
+    changed = true;
+  }
+  return { entries: channelEntries, changed };
+}
+
+export function resolveEdgeMapperForNodeConstants(edgeMapper, nodeMapper, options = {}) {
+  if (!edgeMapper || edgeMapper.mode !== 'edge' || !nodeMapper?.channels) return edgeMapper;
+  const network = options.network ?? edgeMapper.network ?? nodeMapper.network ?? null;
+  const debug = options.debug ?? null;
+  const entries = new Map();
+  for (const [name, config] of edgeMapper.channels.entries()) {
+    entries.set(name, { ...config, attributes: config.attributes ?? config.from });
+  }
+  const resolved = resolveEdgeChannelEntriesForNodeConstants(entries, nodeMapper, network, debug);
+  if (!resolved.changed) return edgeMapper;
+  const derived = new Mapper({ mode: 'edge', network });
+  for (const [name, config] of resolved.entries.entries()) {
+    derived.setChannel(name, config);
+  }
+  return derived;
 }
 
 class ChannelBuilder {
@@ -359,6 +700,7 @@ class ChannelBuilder {
     if (options?.domain) this.config.domain = options.domain;
     if (options?.alpha != null) this.config.alpha = options.alpha;
     if (options?.clamp != null) this.config.clamp = options.clamp;
+    if (options?.divergent != null) this.config.divergent = options.divergent;
     return this;
   }
 
@@ -454,6 +796,17 @@ const CHANNEL_DEFS = {
   },
 };
 
+/**
+ * Low-level mapper for one node or edge visual mode.
+ *
+ * @public
+ * @param {object} [options] - Mapper mode (`node` or `edge`), network, and
+ * optional bookkeeping dependencies.
+ * @returns {Mapper} Mapper with an initially empty channel set.
+ * @remarks Most applications should use `MapperCollection` or
+ * `MappersBehavior`. Direct mapper access is still public for custom pipelines
+ * that need to build visual attributes programmatically.
+ */
 export class Mapper {
   constructor(options = {}) {
     this.mode = options.mode ?? 'node';
@@ -472,6 +825,7 @@ export class Mapper {
       this.unregisterChannel(previous);
     }
     const normalized = normalizeChannelConfig(name, config ?? {});
+    this.ensurePercentileLookup(normalized);
     this.ensureBuffersForChannel(normalized);
     this.channels.set(name, normalized);
     return this;
@@ -484,6 +838,7 @@ export class Mapper {
   mapItem(item, context = {}) {
     const result = {};
     for (const [name, config] of this.channels.entries()) {
+      this.ensurePercentileLookup(config);
       result[name] = computeChannelValue(config, item, context);
     }
     return result;
@@ -493,11 +848,23 @@ export class Mapper {
     return items.map((item, index) => this.mapItem(item, { ...context, index }));
   }
 
+  ensurePercentileLookup(config) {
+    if (!isPercentileTransformType(config?.transformType)) return;
+    if (typeof config.__percentileLookup === 'function') return;
+    const lookup = resolvePercentileLookup(this, config);
+    if (typeof lookup === 'function') {
+      config.__percentileLookup = lookup;
+    }
+  }
+
   ensureBuffersForChannel(config) {
     if (!this.network) return;
     const defs = CHANNEL_DEFS[this.mode] ?? {};
     const def = defs[config.name];
     if (!def) return;
+    if (!this.shouldEnsureChannelBuffer(config, def)) {
+      return;
+    }
     const { attribute, type, dimension } = def;
     if (this.isNodePassthroughChannel(config, def)) {
       const sourceAttribute = this.resolveNodeSourceAttribute(config, def);
@@ -518,27 +885,33 @@ export class Mapper {
       return;
     }
 
-    try {
+    const info = resolveAttributeMetadata(this.network, this.mode, attribute);
+    if (!info) {
       if (this.mode === 'node') {
         this.network.defineNodeAttribute(attribute, type, dimension);
       } else {
         this.network.defineEdgeAttribute(attribute, type, dimension);
       }
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('already')) {
-        console.warn(`Mapper ensureBuffersForChannel failed for ${config.name}:`, error);
-      }
     }
 
     if (this.mode === 'node') {
-      const buffer = this.safeGetAttributeBuffer('node', attribute);
-      validateAttribute(buffer, attribute, type, dimension);
-      this.registerDense('node', attribute);
+      const info = resolveAttributeMetadata(this.network, 'node', attribute);
+      validateAttribute(info, attribute, type, dimension);
     } else {
-      const buffer = this.safeGetAttributeBuffer('edge', attribute);
-      validateAttribute(buffer, attribute, type, dimension);
-      this.registerDense('edge', attribute);
+      const info = resolveAttributeMetadata(this.network, 'edge', attribute);
+      validateAttribute(info, attribute, type, dimension);
     }
+  }
+
+  shouldEnsureChannelBuffer(config, def) {
+    if (!def) return false;
+    if (config.type === 'constant' && (!config.rules || config.rules.length === 0)) {
+      return (
+        def.attribute === NODE_POSITION_ATTRIBUTE ||
+        def.attribute === EDGE_ENDPOINTS_POSITION_ATTRIBUTE
+      );
+    }
+    return true;
   }
 
   isNodePassthroughChannel(config, def) {
@@ -563,9 +936,9 @@ export class Mapper {
 
   resolveNodeSourceDimension(sourceAttribute, def) {
     if (!sourceAttribute) return null;
-    const buffer = this.safeGetAttributeBuffer('node', sourceAttribute);
-    if (buffer?.dimension != null) {
-      return buffer.dimension;
+    const info = resolveAttributeMetadata(this.network, 'node', sourceAttribute);
+    if (info?.dimension != null) {
+      return info.dimension;
     }
     if (def?.nodeSourceDimension) {
       return def.nodeSourceDimension;
@@ -627,58 +1000,76 @@ export class Mapper {
   }) {
     if (!attribute || !sourceAttribute) return;
     this.unregisterNodeToEdge(attribute);
-    this.removeEdgeAttribute(attribute);
-    try {
-      this.network.defineNodeAttribute(sourceAttribute, type, sourceDimension);
-    } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('already')) {
-        console.warn(`Mapper failed to define node attribute ${sourceAttribute} for ${channelName}:`, error);
+    if (resolveAttributeMetadata(this.network, 'edge', attribute)) {
+      try {
+        this.removeEdgeAttribute(attribute);
+      } catch (_) {
+        // The registration path below retries removal if the edge attribute still exists.
       }
     }
+    const sourceInfo = resolveAttributeMetadata(this.network, 'node', sourceAttribute);
+    if (!sourceInfo) {
+      this.network.defineNodeAttribute(sourceAttribute, type, sourceDimension);
+    } else {
+      try {
+        validateAttribute(sourceInfo, sourceAttribute, type, sourceDimension);
+      } catch (error) {
+        console.warn(`Mapper found incompatible node attribute ${sourceAttribute} for ${channelName}:`, error);
+        return;
+      }
+    }
+    let passthroughOk = false;
     try {
       this.network.defineNodeToEdgeAttribute(sourceAttribute, attribute, endpoints, doubleWidth);
+      passthroughOk = true;
     } catch (error) {
-      if (!(error instanceof Error) || !error.message.includes('already')) {
+      const msg = error instanceof Error ? error.message : '';
+      if (typeof this.network?.removeEdgeAttribute === 'function' && /already exists/i.test(msg)) {
+        // Retry once so endpoint changes don't get ignored when removal fails silently.
+        try {
+          this.network.removeEdgeAttribute(attribute);
+          this.network.defineNodeToEdgeAttribute(sourceAttribute, attribute, endpoints, doubleWidth);
+          passthroughOk = true;
+        } catch (retryError) {
+          console.warn(`Mapper failed to redefine node-to-edge attribute for ${channelName}:`, retryError);
+        }
+      } else {
         console.warn(`Mapper failed to define node-to-edge attribute for ${channelName}:`, error);
       }
     }
-    const sourceBuffer = this.safeGetAttributeBuffer('node', sourceAttribute);
-    const edgeBuffer = this.safeGetAttributeBuffer('edge', attribute);
-    const expected = targetDimension ?? computePassthroughTargetDimension(sourceDimension, endpoints, doubleWidth);
-    validateAttribute(sourceBuffer, sourceAttribute, type, sourceDimension);
-    validateAttribute(edgeBuffer, attribute, type, expected);
-    this.nodeToEdgeRegistrations.add(attribute);
-    this.registerDense('node', sourceAttribute);
-    this.registerDense('edge', attribute);
-  }
-
-  safeGetAttributeBuffer(scope, name) {
-    if (!this.network || !name) return null;
-    const getter = scope === 'node' ? 'getNodeAttributeBuffer' : 'getEdgeAttributeBuffer';
-    try {
-      return this.network[getter](name);
-    } catch (_) {
-      return null;
+    if (passthroughOk && typeof this.network?.hasNodeToEdgeAttribute === 'function') {
+      try {
+        passthroughOk = Boolean(this.network.hasNodeToEdgeAttribute(attribute));
+      } catch (_) {
+        // ignore
+      }
     }
+    const resolvedSourceInfo = resolveAttributeMetadata(this.network, 'node', sourceAttribute);
+    const edgeInfo = resolveAttributeMetadata(this.network, 'edge', attribute);
+    const expected = targetDimension ?? computePassthroughTargetDimension(sourceDimension, endpoints, doubleWidth);
+    validateAttribute(resolvedSourceInfo, sourceAttribute, type, sourceDimension);
+    validateAttribute(edgeInfo, attribute, type, expected);
+    if (passthroughOk) {
+      this.nodeToEdgeRegistrations.add(attribute);
+    } else {
+      this.nodeToEdgeRegistrations.delete(attribute);
+    }
+
+    // No explicit buffer bumps here: renderer invalidation for node-to-edge
+    // passthrough config changes is handled centrally in GraphLayer (derived
+    // version augmentation) to avoid surprising side-effects.
   }
 
   removeEdgeAttribute(name) {
     if (!this.network?.removeEdgeAttribute || !name) return;
     try {
       this.network.removeEdgeAttribute(name);
-    } catch (_) {
-      // ignore failures when removing stale attributes
-    }
-  }
-
-  registerDense(scope, name) {
-    const method =
-      scope === 'node' ? this.network?.addDenseNodeAttributeBuffer : this.network?.addDenseEdgeAttributeBuffer;
-    if (typeof method !== 'function') return;
-    try {
-      method.call(this.network, name);
-    } catch (_) {
-      // ignore duplicates or unsupported dense buffers
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : '';
+      if (/unknown edge attribute/i.test(msg) || /does not exist/i.test(msg) || /not defined/i.test(msg)) {
+        return;
+      }
+      throw error;
     }
   }
 
@@ -703,13 +1094,23 @@ export class Mapper {
   }
 }
 
+/**
+ * Create the default node and edge mapper collections for a network.
+ *
+ * @public
+ * @param {import('helios-network').default} network - Source graph.
+ * @returns {{nodeMapper:Mapper,edgeMapper:Mapper}} Default node and edge
+ * mappers used when Helios is constructed without custom mappers.
+ */
 export function createDefaultMappers(network) {
+  const denom = Math.max(1, (network?.nodeCount ?? network?.nodeCapacity ?? 1) - 1);
+  const defaultNodeColor = createColormapScale(DEFAULT_NODE_COLORMAP, { domain: [0, 1], alpha: 1 })(0.6);
   const nodeMapper = new Mapper({ mode: 'node', network });
   nodeMapper
     .channel('color')
     .from('$index')
-    .scale((value, _inputs, _item, ctx) => colorFromIndex(value ?? ctx?.index ?? 0))
-    .default(colorFromIndex(0))
+    .colormap(DEFAULT_NODE_COLORMAP, { domain: [0, denom + 1], alpha: 1, clamp: true })
+    .default(defaultNodeColor)
     .done();
   nodeMapper.channel('size').constant(DEFAULT_NODE_SIZE).done();
   nodeMapper.channel('outline').constant(DEFAULT_NODE_OUTLINE_WIDTH).done();
@@ -718,15 +1119,34 @@ export function createDefaultMappers(network) {
   const edgeMapper = new Mapper({ mode: 'edge', network });
   edgeMapper.channel('color').from('@node.color').nodeToEdge().done();
   edgeMapper.channel('width').constant(1).done();
+  edgeMapper.channel('opacity').constant(1).done();
 
   return { nodeMapper, edgeMapper };
 }
 
-export { VISUAL_ATTRIBUTE_MAP as VISUAL_ATTRIBUTES };
+/**
+ * Map of public mapper channel names to internal Helios visual attribute names.
+ *
+ * @public
+ * @apiSection Mappers
+ */
+export const VISUAL_ATTRIBUTES = VISUAL_ATTRIBUTE_MAP;
 
 /**
  * Convenience container that can hold multiple mappers of the same mode and
  * build a combined mapper when applying visuals.
+ */
+/**
+ * Collection of named mappers for either node or edge visuals.
+ *
+ * @public
+ * @param {'node'|'edge'} mode - Visual target scope.
+ * @param {import('helios-network').default} network - Source graph.
+ * @param {Function} [onChange] - Callback invoked when mapper configuration
+ * changes.
+ * @returns {MapperCollection} Collection with a default mapper.
+ * @remarks Collections let apps keep multiple named mapper presets and combine
+ * them before applying visual attributes.
  */
 export class MapperCollection {
   constructor(mode, network, onChange, debug) {
@@ -809,18 +1229,26 @@ export class MapperCollection {
    * Merges all registered mappers into a single Mapper (channels override in
    * insertion order).
    */
-  toCombinedMapper() {
+  toCombinedMapper(options = {}) {
+    const nodeMapper = options?.nodeMapper ?? null;
     this.debug?.log('mapper', `Combining ${this.mode} mappers`, { count: this.mappers.size });
-    if (this.mappers.size === 1) {
+    if (this.mappers.size === 1 && !(this.mode === 'edge' && nodeMapper)) {
       // Fast path: no need to merge when only one mapper is registered.
       return this.mappers.values().next().value;
     }
     const combined = new Mapper({ mode: this.mode, network: this.network });
+    const channelEntries = new Map();
     for (const mapper of this.mappers.values()) {
       for (const [name, config] of mapper.channels.entries()) {
         const cloned = { ...config, attributes: config.attributes ?? config.from };
-        combined.setChannel(name, cloned);
+        channelEntries.set(name, cloned);
       }
+    }
+    if (this.mode === 'edge') {
+      resolveEdgeChannelEntriesForNodeConstants(channelEntries, nodeMapper, this.network, this.debug);
+    }
+    for (const [name, config] of channelEntries.entries()) {
+      combined.setChannel(name, config);
     }
     this.debug?.log('mapper', `Combined ${this.mode} mappers`, { channels: combined.channels.size });
     return combined;

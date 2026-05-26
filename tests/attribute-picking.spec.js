@@ -47,16 +47,8 @@ async function collectPicks(page) {
       };
     }
     const rect = canvas.getBoundingClientRect();
-    let encodedDebug = null;
-    let positionDebug = null;
-    let sizeDebug = null;
     let nodePixelsNonZero = null;
     try {
-      const encoded = helios.network?.getDenseColorEncodedNodeAttributeView?.('_helios_encoded_node_$index');
-      encodedDebug = encoded?.view ? Array.from(encoded.view.slice(0, 8)) : null;
-      const graph = helios.renderer?.graphLayer?.readDenseGraph?.(helios.network);
-      positionDebug = graph?.nodes?.positions ? graph.nodes.positions.length : null;
-      sizeDebug = graph?.nodes?.sizes ? Array.from(graph.nodes.sizes.slice(0, 4)) : null;
       if (helios.renderer?.readPixels && targets?.node) {
         const all = await helios.renderer.readPixels(targets.node, { x: 0, y: 0, width: targets.node.width, height: targets.node.height });
         const bytes = all instanceof Uint8Array ? all : new Uint8Array(all);
@@ -67,9 +59,6 @@ async function collectPicks(page) {
         nodePixelsNonZero = count;
       }
     } catch (_) {
-      encodedDebug = null;
-      positionDebug = null;
-      sizeDebug = null;
       nodePixelsNonZero = null;
     }
     const xs = Array.from({ length: 8 }, (_, i) => (i + 0.5) / 8);
@@ -95,12 +84,9 @@ async function collectPicks(page) {
 	        renderer: helios.renderer?.device?.type ?? null,
 	        targets: targetInfo,
 	        canvas: { width: rect.width, height: rect.height },
-	        sample,
-	        directPick,
+        sample,
+        directPick,
         counts,
-        encodedDebug,
-        positionDebug,
-        sizeDebug,
         nodePixelsNonZero,
       },
     };
@@ -109,7 +95,7 @@ async function collectPicks(page) {
 
 	async function runPickFlow(page, params) {
 	  const query = new URLSearchParams({ nodes: '4', layout: 'none', mode: '2d', renderer: 'webgl', pickTest: '1', ...params });
-	  await page.goto(`/?${query.toString()}`);
+	  await page.goto(`/tests/fixtures/demo.html?${query.toString()}`);
 	  await waitForHelios(page);
 	  const picks = await collectPicks(page);
   if (!picks.nodeHits.length) {
@@ -129,7 +115,7 @@ test('attribute picking works in headless chromium (webgl)', async ({ page }) =>
 
 	test('@webgpu attribute picking works in headed webgpu when available', async ({ page }) => {
 	  // Navigate first so the origin is one we explicitly mark as secure for WebGPU.
-	  await page.goto('/');
+	  await page.goto('/tests/fixtures/blank.html');
 	  const supported = await page.evaluate(() => Boolean(navigator.gpu));
 	  test.skip(!supported, 'WebGPU not available in browser');
 	  const picks = await runPickFlow(page, { renderer: 'webgpu' });

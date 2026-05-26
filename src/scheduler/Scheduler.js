@@ -17,6 +17,7 @@ export class Scheduler {
     this._layoutBusy = false;
     this._layoutActive = false;
     this.layoutEnabled = options.layoutEnabled !== false;
+    this.layoutState = this.layoutEnabled ? 'running' : 'stopped';
     this._layoutStartReason = null;
     this._layoutStopReason = null;
     this._layoutStartTimestamp = 0;
@@ -41,10 +42,12 @@ export class Scheduler {
         Number.isFinite(options.attributeFrameSkip) && options.attributeFrameSkip > 0
           ? Math.floor(options.attributeFrameSkip)
           : 0,
+      runWhenIdle: options.attributeRunWhenIdle === true,
     };
     this._attributeTimer = null;
     this._lastAttributeTime = -Infinity;
     this._lastAttributeRenderCount = 0;
+    this.renderPump = null;
     this.debug =
       options.debug && typeof options.debug.log === 'function'
         ? options.debug
@@ -57,6 +60,16 @@ export class Scheduler {
       attributeFrameSkip: this.attributeUpdateConfig.frameSkip,
       layoutEnabled: this.layoutEnabled,
     });
+  }
+
+  _resolveDisabledLayoutState(reason = null) {
+    return reason === 'alpha-min' || reason === 'idle' || reason === 'temperature'
+      ? 'idle'
+      : 'stopped';
+  }
+
+  getLayoutState() {
+    return this.layoutState;
   }
 
   setLayout(layout) {
@@ -74,6 +87,10 @@ export class Scheduler {
   setRenderCallback(callback) {
     this.renderCallback = callback;
     this.debug.log('scheduler', 'Render callback registered');
+  }
+
+  setRenderPump(callback) {
+    this.renderPump = typeof callback === 'function' ? callback : null;
   }
 
   requestLayout() {
@@ -104,14 +121,24 @@ export class Scheduler {
 
   setLayoutEnabled(enabled, reason = null) {
     const next = enabled !== false;
-    if (next === this.layoutEnabled) return;
+    if (next === this.layoutEnabled) {
+      if (!next && reason != null) {
+        this._layoutStopReason = reason;
+        this.layoutState = this._resolveDisabledLayoutState(reason);
+      } else if (next) {
+        this.layoutState = 'running';
+      }
+      return;
+    }
     this.layoutEnabled = next;
     if (!next) {
       this._layoutStopReason = reason ?? 'user';
       this._needsLayout = false;
+      this.layoutState = this._resolveDisabledLayoutState(this._layoutStopReason);
     } else {
       this._layoutStartReason = reason ?? 'user';
       this._needsLayout = true;
+      this.layoutState = 'running';
     }
   }
 
@@ -176,6 +203,9 @@ export class Scheduler {
         ? Math.floor(options.frameSkip)
         : 0;
     }
+    if (options.runWhenIdle != null) {
+      cfg.runWhenIdle = options.runWhenIdle === true;
+    }
     this.attributeUpdateConfig = cfg;
     this._restartAttributeTimer();
   }
@@ -191,6 +221,7 @@ export class Scheduler {
     this._clearAttributeTimer();
     if (!this.running) return;
     if (!this.attributeUpdateConfig.autoUpdate) return;
+    if (!this.attributeUpdateConfig.runWhenIdle) return;
     if (!this.attributeCallback) return;
     const interval = this.attributeUpdateConfig.maxFrameInterval;
     const delay = interval > 0 ? interval : 16;
@@ -207,6 +238,7 @@ export class Scheduler {
     if (!this.attributeUpdateConfig.autoUpdate) return;
     if (!this.attributeCallback) return;
     if (!this.currentFrame) return;
+    if (!this.attributeUpdateConfig.runWhenIdle && reason !== 'render') return;
     const now = performance.now();
     const elapsed = now - this._lastAttributeTime;
     const interval = this.attributeUpdateConfig.maxFrameInterval;
@@ -311,6 +343,15 @@ export class Scheduler {
       }
       this._needsGeometry = false;
       this._needsRender = true;
+    }
+
+    if (this.renderPump && this.currentFrame) {
+      try {
+        const wantsRender = this.renderPump({ timestamp, frame: this.currentFrame });
+        if (wantsRender) this.requestRender();
+      } catch (error) {
+        console.warn('Scheduler render pump failed', error);
+      }
     }
 
     if (this.renderCallback && this.currentFrame && this._needsRender) {

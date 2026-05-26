@@ -20,8 +20,8 @@ npm run test    # runs the node colormap unit test
 
 Point your browser at `http://localhost:5173` to interact with the bundled
 example (located in `docs/examples/basic`). It creates a sample graph, applies
-worker layout updates, and renders it via dense buffers pulled straight from
-`helios-network` so you can verify the stack end-to-end.
+worker layout updates, and renders it through the indirect pipelines backed by
+`helios-network` sparse/indexed buffers so you can verify the stack end-to-end.
 
 ## Documentation & Examples
 
@@ -29,6 +29,17 @@ All package-focused notes now live under [`docs/`](./docs/README.md) so you can
 ship this as a reusable dependency. The directory includes a growing set of
 examples (starting with [`docs/examples/basic`](./docs/examples/basic/)) plus
 step-by-step installation and API guidance.
+
+The GPU-force layout supports `forceNormalizationType` for linear attraction:
+`local-degree` keeps the legacy GPU behavior, `degree` matches d3-style
+endpoint-degree normalization, `strength` uses a derived weighted endpoint
+strength buffer, and `none` disables the attraction denominator.
+The default linear GPU-force layout also applies a small generated tuning model
+that only adjusts `outputScale`, leaving the force constants at their defaults.
+This gives tiny and dense graphs more visual separation without changing the
+physical force balance. Pass
+`layout.options.tuningModel = false` to restore the hand defaults, or pass a
+custom model function/object to override the bundled coefficients.
 
 ## Using as a Library
 
@@ -44,10 +55,195 @@ network.addNodes(5);
 
 const helios = new Helios(network, { container: '#app' });
 await helios.ready;
+
+// Optional SVG labels overlay (regular labels stay off until enabled directly or by the Selection panel).
+helios.labels({
+  enabled: true,
+  maxVisible: 120,
+  source: null, // auto fallback: Label -> Name -> id
+  offsetRadiusFactor: 1, // (centerY - projectedRadius) * factor
+  offsetPx: 4, // additional pixel offset (positive moves up)
+  maxChars: 45, // 0 disables truncation
+  maxRows: 2, // >1 enables wrapping with ellipsis
+});
+
+// SVG legends are enabled by default for legendable color mappings.
+helios.legends({
+  showNodeSize: true, // optional size cue when the mapper is legendable
+  showEdgeWidth: true, // optional width cue when the mapper is legendable
+  // Legends default to outlined text with no surrounding frame.
+  showPanel: true, // optional subtle backdrop if you want one
+  panelOpacity: 0.14, // keep it light; default is ignored unless showPanel is true
+  legendClickAction: 'highlight', // default; use 'select' for selection clicks
+  scale: 1.1, // scales legend geometry
+  continuousHeight: 160, // taller continuous colorbars
+  zoomAwareSizeIn2D: true, // node size legends track 2D orthographic zoom by default
+  titles: {
+    nodeColor: null, // remove a title
+    density: 'Density difference', // or override one
+  },
+  placements: {
+    density: 'bottom-right',
+    nodeColor: 'top-left',
+    // edgeColor: { x: 24, y: 180 }, // manual coordinates inside the usable viewport
+  },
+});
+
+// Density maps:
+// - comparisonMode: 'difference' keeps the existing normalized comparison path
+// - comparisonMode: 'logRatio' enables a real-valued log-ratio surface with a numeric legend
+//   and automatic low-support tail suppression so sparse border regions do not blow up visually
+helios.density({
+  enabled: true,
+  property: 'weight',
+  compareProperty: 'Uniform',
+  comparisonMode: 'logRatio',
+  bandwidth: 28.1,
+  logRatioRange: 3, // symmetric legend / clipping domain: [-3, 3]
+  epsilon: 1e-6,
+  logRatioZScore: false, // enable the fast approximate local z-score instead of the raw log-ratio
+  logRatioSupportCorrection: true, // disable to show the raw log-ratio / z-score everywhere
+  maskThreshold: 0, // optional extra pooled-support floor; 0 keeps the automatic epsilon-based floor
+  divergingColormap: 'interpolateRdBu',
+});
+
+// Figure export:
+// - preset: 'window' | 'window@x2' | 'window@x4' | '1080p' | '4k' | '8k' | 'custom'
+// - supersampling only affects the raster pass; SVG stays self-contained and embeds that bitmap.
+// - transparentBackground: false keeps the figure opaque with the current background color.
+// - transparentBackground: true preserves alpha in both PNG and SVG exports.
+// - alphaMode only matters when transparentBackground is true:
+//   'straight' is the standard/unpremultiplied PNG/SVG alpha mode, 'premultiplied' keeps raw framebuffer RGB.
+const svgBlob = await helios.exportFigureBlob({
+  format: 'svg',
+  preset: '4k',
+  supersampling: 2,
+  includeLegends: true,
+  includeLabels: true,
+  transparentBackground: true,
+  alphaMode: 'straight',
+});
+
+await helios.exportFigure('figure.png', {
+  preset: 'window@x2',
+  supersampling: 2,
+  includeLegends: true,
+  includeLabels: false,
+});
+
+// Render quality controls:
+// - supersampling defaults to "auto": DPR < 2 gets a 2x backing-store boost,
+//   retina-class screens stay at native DPR unless you force it on.
+// - antialias defaults to WebGL on / WebGPU off unless you opt in.
+// - edgeAdaptiveQuality is enabled by default and averages recent active-frame
+//   times while the camera/layout is moving; if that average gets too high it
+//   temporarily uses cheap line edges, then returns to high quality once static.
+const crispHelios = new Helios(network, {
+  container: '#app',
+  antialias: true,     // WebGL context AA, or 4x MSAA on the WebGPU canvas pass
+  supersampling: 'auto', // false | true | number | 'auto'
+  edgeAdaptiveQuality: {
+    enabled: true,
+    slowFrameThresholdMs: 66,
+    averageWindowFrames: 12,
+    probeIntervalMs: 900,
+    interactionHoldMs: 180,
+  },
+  // forceSupersample: true, // legacy alias for always applying the auto factor
+});
+
+// Camera helpers:
+helios.cameraControls({
+  autoFit: true,
+  animation: true,
+  orbit: false,
+  orbitAxis: [0, 1, 0],
+  orbitAngle: 0,
+});
+helios.cameraTargetNodes([0, 1, 2]);
+helios.cameraFollowNodes([0, 1, 2], { animate: true }); // keeps the centroid centered while positions move
+helios.frameNetwork({ animate: true, resetOrientation: false });
+
+// Narrow delegate readback helpers:
+await helios.snapshotNodePosition(7);
+await helios.snapshotNodePositions([7, 11, 13]);
+await helios.snapshotNodeCentroid([7, 11, 13]);
 ```
 
 The same API powers the example under `docs/examples/basic/main.js`, making it
 easy to copy-paste a working setup into your own application.
+
+Interpolation is GPU shader based. Timing can run in adaptive mode (average
+recent layout intervals) or a fixed override:
+
+```js
+helios.interpolation({ durationMode: 'adaptive', adaptiveDurationSamples: 5, adaptiveDurationWindowMs: 5000 });
+helios.interpolation({ fixedDurationMs: 160 }); // forces fixed timing
+helios.interpolation({ durationMode: 'adaptive' }); // switch back
+```
+
+For layout-driven positions:
+- GPU-force layout automatically uses a position delegate and keeps it attached.
+- Non-delegate layouts automatically use network position buffers.
+- Built-in layouts now run at scheduler cadence (no `updateIntervalMs` throttling).
+
+Graph filtering can be applied from Helios with independent node/edge criteria.
+Edges are automatically induced by the filtered node set:
+
+```js
+helios.setGraphFilter({
+  nodeQuery: 'weight >= 0.5',
+  edgeQuery: 'intensity >= 0.2',
+  scope: 'render+layout', // or 'render'
+});
+
+helios.clearGraphFilter();
+```
+
+Scene dimension can also be toggled directly from the API. This switches the
+camera mode/projection and asks any active dimension-aware layout to move into
+the matching 2D/3D mode:
+
+```js
+await helios.setMode('3d');
+await helios.setMode('2d');
+const currentMode = helios.mode(); // '2d' | '3d'
+```
+
+For reusable camera animation work, Helios also exposes direct pose capture and
+transition helpers:
+
+```js
+const pose = helios.cameraPose();
+
+await helios.transitionCamera({
+  mode: '3d',
+  projection: 'perspective',
+  target: [0, 0, 0],
+  distance: 900,
+}, { durationMs: 600 });
+```
+
+For reusable filter presets, use `HeliosFilter` and activate whichever one you need:
+
+```js
+import { HeliosFilter } from 'helios-web-next';
+
+const exploratory = new HeliosFilter({ scope: 'render+layout' });
+exploratory.addRule({ scope: 'node', type: 'numeric', attribute: 'weight', min: 0.4, max: 1.0, extentMin: 0, extentMax: 1 });
+exploratory.addRule({ scope: 'node', type: 'string', attribute: 'label', operator: 'contains', value: 'hub' });
+
+const strict = new HeliosFilter({ scope: 'render' });
+strict.addRule({ scope: 'node', type: 'categorical', attribute: 'category', values: ['core'] });
+
+helios.activateHeliosFilter(exploratory);
+// later…
+helios.activateHeliosFilter(strict);
+```
+
+Position delegation now uses an abstract `PositionDelegate` contract, so delegates
+can safely synchronize against topology/index version changes before handing
+buffers to the renderer.
 
 ## Headless Smoke Test
 
@@ -68,26 +264,31 @@ both the rendering stack and the documentation example stay functional.
   `ResizeObserver` hook.
 - **Visuals & mapping (`src/pipeline/*.js`)** – ensure visual attributes live
   directly inside the `helios-network` object, seed defaults, validate
-  dimensions/types, and mark dense buffers dirty when mappers write into sparse
+  dimensions/types, and keep sparse visual buffers in sync when mappers write
+  into attributes
   attributes.
 - **Scheduler (`src/scheduler/Scheduler.js`)** – lightweight coordinator that
   sequences layout ticks, geometry updates, and draw calls. Layouts can
   advertise that they should run continuously or only when explicitly marked
   dirty.
 - **Layouts (`src/layouts`)** – base class + `StaticLayout` fallback +
-  `WorkerLayout` that proxies work to `src/workers/layoutWorker.js`. Workers can
-  push updated positions back to the main thread without touching DOM/APIs.
+  `WorkerLayout` that proxies work to `src/workers/layoutWorker.js`, plus
+  `D3Force3DLayout` for the d3-force-3d worker. Workers can push updated
+  positions back to the main thread without touching DOM/APIs.
+
+By default, Helios uses the d3-force-3d worker layout.
 - **Rendering (`src/rendering`)** – the new modular `LayeredRenderer` chooses
   WebGPU when available (falling back to WebGL2) and exposes layers, materials,
   shader overrides, framebuffer capture/present helpers, and projection
   utilities. The default graph layer still uploads raw attribute views (no
   extra copies) and draws edges before nodes. Force selection via the Helios
-  option `renderer: 'webgl' | 'webgpu'` when needed.
+  option `renderer: 'webgl' | 'webgpu'` when needed. Helios now runs indirect
+  rendering only on both WebGPU and WebGL2.
 
 Development docs and test commands live in `DEVELOPING.md`.
 - **Attribute mapping (`src/pipeline/Mapper.js`)** – helper to convert arbitrary
   node/edge attributes into colors or sizes; mapped values are written into
-  sparse visual attributes and flagged for dense rebuilds.
+  sparse visual attributes.
 
 The demo in `docs/examples/basic/main.js` showcases how to instantiate a
 network, define visual attributes, and kick off Helios with a worker-driven

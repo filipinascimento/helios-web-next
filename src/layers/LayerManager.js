@@ -1,3 +1,5 @@
+import { getWindowDevicePixelRatio, resolveEffectiveDevicePixelRatio } from '../rendering/qualityOptions.js';
+
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 function resolveContainer(target) {
@@ -14,6 +16,22 @@ function resolveContainer(target) {
   return target;
 }
 
+function normalizeViewportInsets(insets) {
+  if (!insets || typeof insets !== 'object') {
+    return { top: 0, right: 0, bottom: 0, left: 0 };
+  }
+  const coerce = (value) => {
+    const numeric = Number(value);
+    return Number.isFinite(numeric) ? Math.max(0, numeric) : 0;
+  };
+  return {
+    top: coerce(insets.top),
+    right: coerce(insets.right),
+    bottom: coerce(insets.bottom),
+    left: coerce(insets.left),
+  };
+}
+
 /**
  * Manages the DOM layers (canvas, SVG overlay, HTML overlays) that can be used
  * by Helios for rendering and interaction.
@@ -24,6 +42,9 @@ export class LayerManager {
     if (!this.container) {
       throw new Error('A valid container element is required');
     }
+    this.options = options;
+
+    const suppressBrowserGestures = options.suppressBrowserGestures !== false;
 
     this.root = document.createElement('div');
     this.root.className = 'helios-root';
@@ -32,7 +53,10 @@ export class LayerManager {
       width: '100%',
       height: '100%',
       overflow: 'hidden',
-      touchAction: 'none',
+      touchAction: suppressBrowserGestures ? 'none' : 'auto',
+      ...(suppressBrowserGestures
+        ? { overscrollBehavior: 'none', overscrollBehaviorX: 'none', overscrollBehaviorY: 'none' }
+        : null),
     });
 
     this.canvas3d = document.createElement('canvas');
@@ -43,6 +67,12 @@ export class LayerManager {
       width: '100%',
       height: '100%',
       display: 'block',
+      userSelect: 'none',
+      webkitUserSelect: 'none',
+      touchAction: suppressBrowserGestures ? 'none' : 'auto',
+      ...(suppressBrowserGestures
+        ? { overscrollBehavior: 'none', overscrollBehaviorX: 'none', overscrollBehaviorY: 'none' }
+        : null),
     });
 
     this.svgLayer = document.createElementNS(SVG_NS, 'svg');
@@ -53,6 +83,8 @@ export class LayerManager {
       width: '100%',
       height: '100%',
       pointerEvents: 'none',
+      userSelect: 'none',
+      webkitUserSelect: 'none',
     });
 
     this.htmlOverlay = document.createElement('div');
@@ -61,17 +93,40 @@ export class LayerManager {
       position: 'absolute',
       inset: 0,
       pointerEvents: 'none',
+      userSelect: 'none',
+      webkitUserSelect: 'none',
     });
 
-    this.root.appendChild(this.canvas3d);
-    this.root.appendChild(this.svgLayer);
-    this.root.appendChild(this.htmlOverlay);
+    this.viewport = document.createElement('div');
+    this.viewport.className = 'helios-layer-viewport';
+    Object.assign(this.viewport.style, {
+      position: 'absolute',
+      inset: '0px',
+      overflow: 'hidden',
+      userSelect: 'none',
+      webkitUserSelect: 'none',
+    });
+
+    this.viewport.appendChild(this.canvas3d);
+    this.viewport.appendChild(this.svgLayer);
+    this.viewport.appendChild(this.htmlOverlay);
+    this.root.appendChild(this.viewport);
 
     this.container.appendChild(this.root);
 
+    this._boundWheelBlocker = null;
+    if (suppressBrowserGestures) {
+      this._boundWheelBlocker = (event) => {
+        if (event?.cancelable) event.preventDefault();
+        event?.stopPropagation?.();
+      };
+      this.canvas3d.addEventListener('wheel', this._boundWheelBlocker, { passive: false });
+    }
+
     this.layers = new Map();
     this.resizeListeners = new Set();
-    const pixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    this.viewportInsets = { top: 0, right: 0, bottom: 0, left: 0 };
+    const pixelRatio = resolveEffectiveDevicePixelRatio(getWindowDevicePixelRatio(), this.options);
     this.size = { width: 0, height: 0, devicePixelRatio: pixelRatio };
 
     this.boundResize = () => this.handleResize();
@@ -104,6 +159,26 @@ export class LayerManager {
     this.root.appendChild(element);
   }
 
+  setViewportInsets(insets) {
+    const next = normalizeViewportInsets(insets);
+    const prev = this.viewportInsets;
+    if (
+      prev.top === next.top
+      && prev.right === next.right
+      && prev.bottom === next.bottom
+      && prev.left === next.left
+    ) {
+      return this;
+    }
+    this.viewportInsets = next;
+    this.viewport.style.top = `${next.top}px`;
+    this.viewport.style.right = `${next.right}px`;
+    this.viewport.style.bottom = `${next.bottom}px`;
+    this.viewport.style.left = `${next.left}px`;
+    this.handleResize();
+    return this;
+  }
+
   removeLayer(name) {
     const element = this.layers.get(name);
     if (element) {
@@ -118,9 +193,14 @@ export class LayerManager {
     return () => this.resizeListeners.delete(callback);
   }
 
+  setSupersampling(supersampling) {
+    this.options.supersampling = supersampling;
+    this.handleResize();
+  }
+
   handleResize() {
-    const rect = this.root.getBoundingClientRect();
-    const pixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const rect = this.viewport.getBoundingClientRect();
+    const pixelRatio = resolveEffectiveDevicePixelRatio(getWindowDevicePixelRatio(), this.options);
     const width = Math.max(1, Math.floor(rect.width));
     const height = Math.max(1, Math.floor(rect.height));
 
@@ -142,6 +222,10 @@ export class LayerManager {
       this.resizeObserver.disconnect();
     } else {
       window.removeEventListener('resize', this.boundResize);
+    }
+    if (this._boundWheelBlocker) {
+      this.canvas3d.removeEventListener('wheel', this._boundWheelBlocker);
+      this._boundWheelBlocker = null;
     }
     this.root.remove();
     this.layers.clear();

@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   Mapper,
+  DEFAULT_NODE_COLORMAP,
   colormaps,
   colormapToScheme,
   colormapToInterpolator,
@@ -22,6 +23,13 @@ test('loads embedded cmasher colormap', () => {
   colors.forEach(rgbaInRange);
 });
 
+test('default node colormap resolves with CET aliases', () => {
+  assert.equal(colormapToInterpolator(DEFAULT_NODE_COLORMAP), colormapToInterpolator('CET: L08-NeonBurst'));
+  const colors = colormapToScheme(DEFAULT_NODE_COLORMAP, 5);
+  assert.equal(colors.length, 5);
+  colors.forEach(rgbaInRange);
+});
+
 test('d3 interpolator resolves by name and scales across domain', () => {
   const scale = createColormapScale('interpolateViridis', { domain: [0, 10] });
   const start = scale(0);
@@ -37,6 +45,14 @@ test('continuous colormap can be sampled as categorical scheme', () => {
   const scheme = colormapToScheme(colormaps.d3.interpolatePlasma, 6);
   assert.equal(scheme.length, 6);
   scheme.forEach(rgbaInRange);
+});
+
+test('category18 categorical scheme repeats to requested size', () => {
+  const scheme = colormapToScheme('category18', 20);
+  assert.equal(scheme.length, 20);
+  scheme.forEach(rgbaInRange);
+  assert.deepEqual(scheme[0], scheme[18]);
+  assert.deepEqual(scheme[1], scheme[19]);
 });
 
 test('mapper colormap channel maps values to rgba', () => {

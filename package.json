@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:https": "vite --host --mode https",
     "build": "vite build",
     "preview": "vite preview",
     "test:e2e": "playwright test",
@@ -12,11 +13,16 @@
     "test:e2e:webgpu": "playwright test --headed --project=chromium-webgpu-headed",
     "test:e2e:weighted": "playwright test --headed tests/edge-transparency.spec.js",
     "test:e2e:rendering-options": "playwright test --headed --project=chromium tests/rendering-options.spec.js",
+    "test:e2e:layout-calibration": "playwright test tests/layout-calibration.spec.js --project=chromium",
+    "calibration:generate": "node scripts/layout-calibration/generate-layout-calibration.mjs",
+    "calibration:run": "node scripts/layout-calibration/run-layout-calibration.mjs",
+    "calibration:fit": "node scripts/layout-calibration/fit-layout-model.mjs",
     "test": "node --test tests/*.test.js"
   },
   "dependencies": {
+    "d3-force-3d": "github:filipinascimento/d3-force-3d",
     "d3-scale-chromatic": "^3.1.0",
-    "helios-network": "^0.2.10"
+    "helios-network": "^0.6.0"
   },
   "devDependencies": {
     "@playwright/test": "^1.56.1",
@@ -26,8 +32,10 @@
   },
   "main": "./dist/helios-web.umd.cjs",
   "module": "./dist/helios-web.es.js",
+  "types": "./src/index.d.ts",
   "exports": {
     ".": {
+      "types": "./src/index.d.ts",
       "import": "./dist/helios-web.es.js",
       "require": "./dist/helios-web.umd.cjs"
     }

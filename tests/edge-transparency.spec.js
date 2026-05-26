@@ -2,7 +2,7 @@ import { test, expect } from '@playwright/test';
 import { PNG } from 'pngjs';
 
 async function createOverlapScreenshot(page, mode = 'alpha') {
-  await page.goto('/');
+  await page.goto('/tests/fixtures/blank.html');
   await page.setViewportSize({ width: 320, height: 320 });
 
   const { screenshot, fallback } = await page.evaluate(async ({ transparencyModeEdges }) => {
@@ -15,18 +15,24 @@ async function createOverlapScreenshot(page, mode = 'alpha') {
       { from: 0, to: 1 },
       { from: 0, to: 1 },
     ]);
-    const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color').view;
-    const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width').view;
-    const opacities = network.getEdgeAttributeBuffer('_helios_visuals_edge_opacity').view;
-    colors.set([1, 0, 0, 1, 1, 0, 0, 1], edges[0] * 8);
-    colors.set([0, 0, 1, 1, 0, 0, 1, 1], edges[1] * 8);
-    widths.set([8, 8], edges[0] * 2);
-    widths.set([8, 8], edges[1] * 2);
-    opacities.set([0.8, 0.8], edges[0] * 2);
-    opacities.set([0.2, 0.2], edges[1] * 2);
+    network.withBufferAccess(() => {
+      const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color').view;
+      const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width').view;
+      const opacities = network.getEdgeAttributeBuffer('_helios_visuals_edge_opacity').view;
+      colors.set([1, 0, 0, 1, 1, 0, 0, 1], edges[0] * 8);
+      colors.set([0, 0, 1, 1, 0, 0, 1, 1], edges[1] * 8);
+      widths.set([8, 8], edges[0] * 2);
+      widths.set([8, 8], edges[1] * 2);
+      opacities.set([0.8, 0.8], edges[0] * 2);
+      opacities.set([0.2, 0.2], edges[1] * 2);
+    });
 
     helios.renderer?.setEdgeTransparencyMode?.(transparencyModeEdges);
-    helios.visuals.markAllDenseDirty();
+    helios.visuals.bumpEdgeAttributes?.(
+      '_helios_visuals_edge_color',
+      '_helios_visuals_edge_width',
+      '_helios_visuals_edge_opacity',
+    );
     helios.scheduler.requestGeometry();
     helios.renderer.render({ network, timestamp: performance.now(), camera: helios.renderer.camera });
     await new Promise((resolve) => setTimeout(resolve, 50));

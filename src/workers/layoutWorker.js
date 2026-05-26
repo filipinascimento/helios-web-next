@@ -56,6 +56,10 @@ self.onmessage = (event) => {
     state.options.center = [center[0] ?? 0, center[1] ?? 0, state.options.center?.[2] ?? 0];
     return;
   }
+  if (data.type === 'settings') {
+    state.options = { ...state.options, ...(data.options ?? {}) };
+    return;
+  }
   if (data.type === 'tick' && data.positions instanceof Float32Array) {
     stepLayout(data);
   }
@@ -99,7 +103,7 @@ function runJitterLayout(buffer, timestamp) {
     }
     state.seeded = true;
     state.lastTimestamp = timestamp ?? performance.now();
-    self.postMessage({ type: 'positions', positions: buffer }, [buffer.buffer]);
+    self.postMessage({ type: 'positions', positions: buffer, timestamp: state.lastTimestamp }, [buffer.buffer]);
     return;
   }
 
@@ -119,7 +123,7 @@ function runJitterLayout(buffer, timestamp) {
     buffer[pos + 2] += (Math.random() - 0.5) * jitterScale * (useDepth ? 1 : 0) - buffer[pos + 2] * spring;
     // keep positions bounded without a w component
   }
-  self.postMessage({ type: 'positions', positions: buffer }, [buffer.buffer]);
+  self.postMessage({ type: 'positions', positions: buffer, timestamp: state.lastTimestamp }, [buffer.buffer]);
 }
 
 function runForceDirectedLayout(buffer, timestamp) {
@@ -138,7 +142,7 @@ function runForceDirectedLayout(buffer, timestamp) {
     seedPositions(buffer, activeNodes, useDepth);
     state.seeded = true;
     state.lastTimestamp = timestamp ?? performance.now();
-    self.postMessage({ type: 'positions', positions: buffer }, [buffer.buffer]);
+    self.postMessage({ type: 'positions', positions: buffer, timestamp: state.lastTimestamp }, [buffer.buffer]);
     return;
   }
 
@@ -156,7 +160,7 @@ function runForceDirectedLayout(buffer, timestamp) {
     recenter(buffer, activeNodes, useDepth);
   }
   state.lastTimestamp = timestamp;
-  self.postMessage({ type: 'positions', positions: buffer }, [buffer.buffer]);
+  self.postMessage({ type: 'positions', positions: buffer, timestamp: state.lastTimestamp }, [buffer.buffer]);
 }
 
 function collectActiveNodes(activity, count) {

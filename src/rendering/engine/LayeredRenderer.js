@@ -3,6 +3,22 @@ import { GraphLayerWebGPU } from './GraphLayerWebGPU.js';
 import { WebGL2Device } from './WebGL2Device.js';
 import { WebGPUDevice } from './WebGPUDevice.js';
 import { Camera } from '../Camera.js';
+import { getWindowDevicePixelRatio, resolveEffectiveDevicePixelRatio } from '../qualityOptions.js';
+
+function isDebugWebGLRenderEnabled() {
+  if (globalThis.__HELIOS_DEBUG_WEBGL_RENDER === true) return true;
+  try {
+    const search = globalThis.location?.search ?? '';
+    return search.includes('debugWebGLRender=1');
+  } catch (_) {
+    return false;
+  }
+}
+
+function debugWebGLRender(message, detail) {
+  if (!isDebugWebGLRenderEnabled()) return;
+  console.warn(`[Helios][WebGLRender] ${message}`, detail);
+}
 
 /**
  * High-level orchestrator that owns the underlying graphics device (WebGL2 or
@@ -11,7 +27,7 @@ import { Camera } from '../Camera.js';
  */
 export class LayeredRenderer {
   constructor(canvas, options = {}) {
-    const pixelRatio = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const pixelRatio = resolveEffectiveDevicePixelRatio(getWindowDevicePixelRatio(), options);
     this.canvas = canvas;
     this.options = options;
     this.clearColor = options.clearColor ?? [0.01, 0.01, 0.02, 1];
@@ -187,11 +203,34 @@ export class LayeredRenderer {
   render(frame) {
     if (!this.device) return;
     const renderPayload = frame ? { ...frame, camera: frame.camera ?? this.camera } : { camera: this.camera };
+    debugWebGLRender('renderer:frame:start', {
+      device: this.device?.type ?? null,
+      renderTarget: this.renderTarget ?? null,
+      presentRect: this.presentRect ?? null,
+      size: this.size,
+      layerCount: this.layers.length,
+      networkNodeCount: renderPayload?.network?.nodeCount ?? null,
+      networkEdgeCount: renderPayload?.network?.edgeCount ?? null,
+    });
     const context = this.device.beginFrame(this.renderTarget, this.clearColor, this.presentRect);
     for (const layer of this.layers) {
+      debugWebGLRender('renderer:layer:before', {
+        layer: layer?.name ?? layer?.id ?? layer?.constructor?.name ?? 'unknown',
+        contextType: context?.type ?? null,
+      });
+      const layerStart = performance.now();
       layer.render?.(context, renderPayload, this.size);
+      if (layer && Object.prototype.hasOwnProperty.call(layer, 'lastRenderDurationMs')) {
+        layer.lastRenderDurationMs = performance.now() - layerStart;
+      }
+      debugWebGLRender('renderer:layer:after', {
+        layer: layer?.name ?? layer?.id ?? layer?.constructor?.name ?? 'unknown',
+      });
     }
     this.device.endFrame(context);
+    debugWebGLRender('renderer:frame:end', {
+      device: this.device?.type ?? null,
+    });
     this.presentRect = null;
   }
 
@@ -210,6 +249,19 @@ export class LayeredRenderer {
       transparencyModeEdges: this.options.transparencyModeEdges,
       nodeOutlineColor: this.options.nodeOutlineColor,
       edgeEndpointTrim: this.options.edgeEndpointTrim,
+      nodeBlendWithEdges: this.options.nodeBlendWithEdges,
+      edgeDepthWrite: this.options.edgeDepthWrite,
+      edgeFastRendering: this.options.edgeFastRendering,
+      ambientOcclusionEnabled: this.options.ambientOcclusionEnabled,
+      ambientOcclusionNodes: this.options.ambientOcclusionNodes,
+      ambientOcclusionEdges: this.options.ambientOcclusionEdges,
+      ambientOcclusionStrength: this.options.ambientOcclusionStrength,
+      ambientOcclusionRadius: this.options.ambientOcclusionRadius,
+      ambientOcclusionBias: this.options.ambientOcclusionBias,
+      ambientOcclusionMode: this.options.ambientOcclusionMode,
+      ambientOcclusionIntensityScale: this.options.ambientOcclusionIntensityScale,
+      ambientOcclusionIntensityShift: this.options.ambientOcclusionIntensityShift,
+      stateSlots: this.options.stateSlots,
     };
     if (this.device?.type === 'webgpu') {
       this.graphLayer = new GraphLayerWebGPU(options);

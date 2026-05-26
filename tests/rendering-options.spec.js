@@ -34,13 +34,13 @@ async function capturePageScreenshot(page, testInfo, name, options = {}) {
 
 test.describe('renderer selection', () => {
   test('honors webgl force flag via query param', async ({ page }) => {
-    await page.goto('/?renderer=webgl');
+    await page.goto('/tests/fixtures/demo.html?renderer=webgl');
     const diagnostics = await waitForDiagnostics(page);
     expect(diagnostics.renderer.toLowerCase()).toContain('webgl');
   });
 
   test('defaults to best available backend', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/tests/fixtures/demo.html');
     const hasWebGPU = await page.evaluate(() => Boolean(navigator.gpu));
     const diagnostics = await waitForDiagnostics(page);
     if (hasWebGPU && diagnostics.renderer.toLowerCase().includes('webgpu')) {
@@ -53,7 +53,7 @@ test.describe('renderer selection', () => {
 
 test.describe('renderer helpers', () => {
   test('project/unproject round trips', async ({ page }) => {
-    await page.goto('/?renderer=webgl');
+    await page.goto('/tests/fixtures/demo.html?renderer=webgl');
     await waitForDiagnostics(page);
     const { original, roundTrip } = await page.evaluate(() => {
       const renderer = window.__helios.renderer;
@@ -67,7 +67,7 @@ test.describe('renderer helpers', () => {
   });
 
   test('can create framebuffers and present without errors', async ({ page }) => {
-    await page.goto('/?renderer=webgl');
+    await page.goto('/tests/fixtures/demo.html?renderer=webgl');
     await waitForDiagnostics(page);
     const framebufferInfo = await page.evaluate(() => {
       const renderer = window.__helios.renderer;
@@ -81,7 +81,7 @@ test.describe('renderer helpers', () => {
   });
 
   test('can render to framebuffer and read pixels', async ({ page }) => {
-    await page.goto('/?renderer=webgl');
+    await page.goto('/tests/fixtures/demo.html?renderer=webgl');
     await waitForDiagnostics(page);
     const pixel = await page.evaluate(async () => {
       const renderer = window.__helios.renderer;
@@ -96,7 +96,12 @@ test.describe('renderer helpers', () => {
           }
         },
       });
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      renderer.render({
+        network: window.__helios.network,
+        camera: renderer.camera,
+        timestamp: performance.now(),
+      });
       const result = await renderer.readPixels(fb, { x: 0, y: 0, width: 1, height: 1 });
       renderer.setRenderTarget(null);
       return Array.from(result.slice(0, 4));
@@ -107,7 +112,7 @@ test.describe('renderer helpers', () => {
   });
 
   test('custom layers receive render calls', async ({ page }) => {
-    await page.goto('/?renderer=webgl');
+    await page.goto('/tests/fixtures/demo.html?renderer=webgl');
     await waitForDiagnostics(page);
     const count = await page.evaluate(() => {
       const renderer = window.__helios.renderer;
@@ -127,7 +132,7 @@ test.describe('renderer helpers', () => {
   });
 
   test('renders deterministic node colors at fixed positions', async ({ page }) => {
-    await page.goto('/');
+    await page.goto('/tests/fixtures/blank.html');
     const diagnostics = await page.evaluate(async () => {
       window.__helios?.destroy?.();
       document.body.innerHTML = '<div id="app" style="width:320px;height:320px"></div>';
@@ -186,7 +191,7 @@ test.describe('webgpu visual (headed)', () => {
       test.skip(true, 'Browser fixture unavailable');
     }
 
-    await headedPage.goto('/');
+    await headedPage.goto('/tests/fixtures/blank.html');
     const hasWebGPU = await headedPage.evaluate(() => Boolean(navigator.gpu));
     if (!hasWebGPU) {
       await capturePageScreenshot(headedPage, testInfo, 'no-webgpu');
@@ -304,7 +309,7 @@ test.describe('webgpu visual (headed)', () => {
       test.skip(true, 'Browser fixture unavailable');
     }
 
-    await headedPage.goto('/');
+    await headedPage.goto('/tests/fixtures/blank.html');
     await capturePageScreenshot(headedPage, testInfo, 'weighted-headed-initial');
 
     const result = await headedPage.evaluate(async () => {
@@ -317,19 +322,25 @@ test.describe('webgpu visual (headed)', () => {
         { from: 0, to: 1 },
         { from: 0, to: 1 },
       ]);
-      const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color').view;
-      const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width').view;
-      const opacities = network.getEdgeAttributeBuffer('_helios_visuals_edge_opacity').view;
-      colors.set([1, 0, 0, 1, 1, 0, 0, 1], edges[0] * 8);
-      colors.set([0, 0, 1, 1, 0, 0, 1, 1], edges[1] * 8);
-      widths.set([20, 20], edges[0] * 2);
-      widths.set([20, 20], edges[1] * 2);
-      opacities.set([1.0, 1.0], edges[0] * 2);
-      opacities.set([0.05, 0.05], edges[1] * 2);
+      network.withBufferAccess(() => {
+        const colors = network.getEdgeAttributeBuffer('_helios_visuals_edge_color').view;
+        const widths = network.getEdgeAttributeBuffer('_helios_visuals_edge_width').view;
+        const opacities = network.getEdgeAttributeBuffer('_helios_visuals_edge_opacity').view;
+        colors.set([1, 0, 0, 1, 1, 0, 0, 1], edges[0] * 8);
+        colors.set([0, 0, 1, 1, 0, 0, 1, 1], edges[1] * 8);
+        widths.set([20, 20], edges[0] * 2);
+        widths.set([20, 20], edges[1] * 2);
+        opacities.set([1.0, 1.0], edges[0] * 2);
+        opacities.set([0.05, 0.05], edges[1] * 2);
+      });
 
       const sampleMean = async (mode) => {
         helios.renderer?.setEdgeTransparencyMode?.(mode);
-        helios.visuals.markAllDenseDirty();
+        helios.visuals.bumpEdgeAttributes?.(
+          '_helios_visuals_edge_color',
+          '_helios_visuals_edge_width',
+          '_helios_visuals_edge_opacity',
+        );
         helios.scheduler.requestGeometry();
         helios.renderer.render({ network, timestamp: performance.now(), camera: helios.renderer.camera });
         await new Promise((resolve) => setTimeout(resolve, 80));

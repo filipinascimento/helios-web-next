@@ -103,7 +103,7 @@ test('attribute auto-update runs after renders with optional frame skipping', ()
 });
 
 test('attribute auto-update respects max fps when timer-driven', async () => {
-  const scheduler = createScheduler({ attributeAutoUpdate: true, attributeMaxFps: 2 });
+  const scheduler = createScheduler({ attributeAutoUpdate: true, attributeMaxFps: 2, attributeRunWhenIdle: true });
   const attributeRuns = [];
   scheduler.setAttributeCallback((frame) => {
     attributeRuns.push({ frame: frame.frameId, time: performance.now() });
@@ -120,8 +120,25 @@ test('attribute auto-update respects max fps when timer-driven', async () => {
   assert.equal(attributeRuns.length, 1);
 
   await new Promise((resolve) => setTimeout(resolve, 550));
-  scheduler._maybeRunAttributeUpdate('test');
+  scheduler._maybeRunAttributeUpdate('timer');
   assert.equal(attributeRuns.length, 2, 'attribute update should run after interval elapses');
 
   scheduler.stop();
+});
+
+test('layout state distinguishes idle auto-stop from manual pause', () => {
+  const scheduler = createScheduler();
+
+  assert.equal(scheduler.getLayoutState(), 'running');
+
+  scheduler.setLayoutEnabled(false, 'alpha-min');
+  assert.equal(scheduler.layoutEnabled, false);
+  assert.equal(scheduler.getLayoutState(), 'idle');
+
+  scheduler.setLayoutEnabled(false, 'user');
+  assert.equal(scheduler.getLayoutState(), 'stopped');
+
+  scheduler.setLayoutEnabled(true, 'filter');
+  assert.equal(scheduler.layoutEnabled, true);
+  assert.equal(scheduler.getLayoutState(), 'running');
 });

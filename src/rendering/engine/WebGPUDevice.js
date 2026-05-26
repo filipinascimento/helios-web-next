@@ -1,3 +1,7 @@
+import { bumpCounter } from '../../utilities/counters.js';
+import { ResourceCache } from '../resources/ResourceCache.js';
+import { resolveWebGPUCanvasSampleCount } from '../qualityOptions.js';
+
 const PRESENT_WGSL = /* wgsl */ `
 struct VertexOut {
   @builtin(position) position : vec4<f32>,
@@ -19,7 +23,6 @@ fn vs(@location(0) position : vec2<f32>, @location(1) uv : vec2<f32>) -> VertexO
 fn fs(input : VertexOut) -> @location(0) vec4<f32> {
   return textureSample(textureData, textureSampler, input.uv);
 }`;
-
 export class WebGPUDevice {
   constructor(canvas, options = {}) {
     this.canvas = canvas;
@@ -36,11 +39,16 @@ export class WebGPUDevice {
     this.type = 'webgpu';
     this.size = { width: 1, height: 1, devicePixelRatio: 1 };
     this.depthTexture = null;
-    this.depthSize = { width: 0, height: 0 };
+    this.depthSize = { width: 0, height: 0, sampleCount: 1 };
+    this.colorTexture = null;
+    this.colorSize = { width: 0, height: 0, sampleCount: 1 };
     this.depthFormat = 'depth24plus';
     this.limits = null;
     this.maxStorageBufferBindingSize = null;
     this.requestedLimits = null;
+    this.counters = { beginFrame: 0, presentFramebuffer: 0 };
+    this.resourceCache = new ResourceCache(this.type);
+    this.sampleCount = 1;
   }
 
   static async isSupported() {
@@ -59,6 +67,7 @@ export class WebGPUDevice {
     const bufferLimitRatio = Math.min(Math.max(this.options.bufferLimitRatio ?? 1, 0), 1);
     const adapterStorageLimit = this.adapter.limits?.maxStorageBufferBindingSize;
     const adapterBufferLimit = this.adapter.limits?.maxBufferSize;
+    const adapterStorageBuffersPerStage = this.adapter.limits?.maxStorageBuffersPerShaderStage;
     // Request higher limits (browser default is often 128 MB for storage and 256 MB for buffers).
     const baseStorageLimit = 128 * 1024 * 1024;
     const baseBufferLimit = 256 * 1024 * 1024;
@@ -75,6 +84,9 @@ export class WebGPUDevice {
     if (requestedBufferLimit) {
       requiredLimits.maxBufferSize = requestedBufferLimit;
     }
+    if (adapterStorageBuffersPerStage && adapterStorageBuffersPerStage > 8) {
+      requiredLimits.maxStorageBuffersPerShaderStage = Math.min(adapterStorageBuffersPerStage, 10);
+    }
     this.requestedLimits = Object.keys(requiredLimits).length ? requiredLimits : null;
     this.device = await this.adapter.requestDevice(this.requestedLimits ? { requiredLimits } : {});
     this.limits = this.device.limits;
@@ -84,6 +96,7 @@ export class WebGPUDevice {
       throw new Error('Unable to create WebGPU context');
     }
     this.format = navigator.gpu.getPreferredCanvasFormat();
+    this.sampleCount = resolveWebGPUCanvasSampleCount(this.options);
     this.context.configure({
       device: this.device,
       format: this.format,
@@ -148,20 +161,35 @@ export class WebGPUDevice {
     this.size = size;
   }
 
+  resolveFrameExtent(renderTarget, targetTexture) {
+    const textureWidth = Number.isFinite(targetTexture?.width) ? targetTexture.width : null;
+    const textureHeight = Number.isFinite(targetTexture?.height) ? targetTexture.height : null;
+    return {
+      width: renderTarget?.width ?? textureWidth ?? this.canvas.width,
+      height: renderTarget?.height ?? textureHeight ?? this.canvas.height,
+    };
+  }
+
   beginFrame(renderTarget, clearColor, rect) {
+    this.counters.beginFrame = bumpCounter(this.counters.beginFrame);
     const targetTexture = renderTarget ? renderTarget.texture : this.context.getCurrentTexture();
-    const width = renderTarget?.width ?? this.canvas.width;
-    const height = renderTarget?.height ?? this.canvas.height;
-    const colorView = targetTexture.createView();
+    const { width, height } = this.resolveFrameExtent(renderTarget, targetTexture);
+    const sampleCount = renderTarget ? 1 : this.sampleCount;
+    const colorTexture = sampleCount > 1
+      ? this.ensureColorTexture(width, height, sampleCount)
+      : targetTexture;
+    const colorView = colorTexture.createView();
+    const resolveTargetView = sampleCount > 1 ? targetTexture.createView() : null;
     const depthView = renderTarget?.depthTexture
       ? renderTarget.depthTexture.createView()
-      : this.ensureDepthTexture(width, height)?.createView();
+      : this.ensureDepthTexture(width, height, sampleCount)?.createView();
 
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
         {
           view: colorView,
+          ...(resolveTargetView ? { resolveTarget: resolveTargetView } : {}),
           clearValue: clearColor
             ? { r: clearColor[0], g: clearColor[1], b: clearColor[2], a: clearColor[3] }
             : { r: 0, g: 0, b: 0, a: 1 },
@@ -194,10 +222,12 @@ export class WebGPUDevice {
       quad: this.quadVertexBuffer,
       target: renderTarget,
       colorView,
+      resolveTargetView,
       depthView,
       width,
       height,
       viewport: rect ?? null,
+      sampleCount,
     };
   }
 
@@ -206,6 +236,15 @@ export class WebGPUDevice {
       context.passEncoder.end();
     }
     this.device.queue.submit([context.commandEncoder.finish()]);
+  }
+
+  destroy() {
+    this.resourceCache?.destroy(this);
+    this.quadVertexBuffer?.destroy?.();
+    this.colorTexture?.destroy?.();
+    this.colorTexture = null;
+    this.depthTexture?.destroy?.();
+    this.depthTexture = null;
   }
 
   createFramebuffer(width, height) {
@@ -230,6 +269,7 @@ export class WebGPUDevice {
 
   presentFramebuffer(framebuffer, rect) {
     if (!framebuffer?.texture) return;
+    this.counters.presentFramebuffer = bumpCounter(this.counters.presentFramebuffer);
     const view = this.context.getCurrentTexture().createView();
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
@@ -291,23 +331,43 @@ export class WebGPUDevice {
     return result;
   }
 
-  destroy() {
-    this.quadVertexBuffer?.destroy?.();
-    this.depthTexture?.destroy?.();
-    this.depthTexture = null;
-  }
-
-  ensureDepthTexture(width, height) {
+  ensureDepthTexture(width, height, sampleCount = 1) {
     if (!width || !height) return null;
-    if (!this.depthTexture || this.depthSize.width !== width || this.depthSize.height !== height) {
+    if (
+      !this.depthTexture
+      || this.depthSize.width !== width
+      || this.depthSize.height !== height
+      || this.depthSize.sampleCount !== sampleCount
+    ) {
       this.depthTexture?.destroy?.();
       this.depthTexture = this.device.createTexture({
         size: { width, height, depthOrArrayLayers: 1 },
         format: this.depthFormat,
         usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount,
       });
-      this.depthSize = { width, height };
+      this.depthSize = { width, height, sampleCount };
     }
     return this.depthTexture;
+  }
+
+  ensureColorTexture(width, height, sampleCount = 1) {
+    if (!width || !height || sampleCount <= 1) return null;
+    if (
+      !this.colorTexture
+      || this.colorSize.width !== width
+      || this.colorSize.height !== height
+      || this.colorSize.sampleCount !== sampleCount
+    ) {
+      this.colorTexture?.destroy?.();
+      this.colorTexture = this.device.createTexture({
+        size: { width, height, depthOrArrayLayers: 1 },
+        format: this.format,
+        usage: GPUTextureUsage.RENDER_ATTACHMENT,
+        sampleCount,
+      });
+      this.colorSize = { width, height, sampleCount };
+    }
+    return this.colorTexture;
   }
 }
