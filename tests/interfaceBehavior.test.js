@@ -7,8 +7,16 @@ import {
   createDefaultBehaviorRegistry,
 } from '../src/behaviors/index.js';
 
-class MockPersistenceService {
+class MockStorageService {
   constructor() {
+    this.capabilities = {
+      persistent: true,
+      sessions: true,
+      network: false,
+      remote: false,
+    };
+    this.requestedSessionId = null;
+    this.explicitSessionInvalid = false;
     this.preferences = {
       theme: null,
       autosave: false,
@@ -22,7 +30,9 @@ class MockPersistenceService {
       loadPreferences: 0,
       updatePreferences: [],
       getRestorableSession: 0,
+      getResumePrompt: 0,
       restoreSession: [],
+      resumeSession: [],
       markSessionFinished: [],
       deleteSession: [],
     };
@@ -55,6 +65,29 @@ class MockPersistenceService {
     return this.restorableSession;
   }
 
+  async getResumePrompt() {
+    this.calls.getResumePrompt += 1;
+    const session = this.restorableSession;
+    if (!session?.payload?.session?.id) return null;
+    return {
+      visible: true,
+      sessionId: session.payload.session.id,
+      updatedAt: session.payload.session.updatedAt ?? null,
+      networkSource: session.payload.networkSource ?? null,
+      sessions: [{
+        id: session.payload.session.id,
+        updatedAt: session.payload.session.updatedAt ?? null,
+        networkSource: session.payload.networkSource ?? null,
+        label: session.payload.networkSource?.name ?? session.payload.session.id,
+      }],
+    };
+  }
+
+  async resumeSession(id, options = {}) {
+    this.calls.resumeSession.push({ id, options });
+    return { restored: id };
+  }
+
   async restoreSession(id, options = {}) {
     this.calls.restoreSession.push({ id, options });
     return { restored: id };
@@ -70,7 +103,6 @@ class MockPersistenceService {
     return true;
   }
 }
-
 class MockUI {
   constructor(width = 1440) {
     this.width = width;
@@ -97,7 +129,7 @@ class MockUI {
 class MockHelios extends EventTarget {
   constructor({ width = 1440 } = {}) {
     super();
-    this.persistence = new MockPersistenceService();
+    this.storage = new MockStorageService();
     this.ui = new MockUI(width);
   }
 
@@ -110,16 +142,16 @@ class MockHelios extends EventTarget {
 function attachInterfaceBehavior(options = {}) {
   const helios = new MockHelios({ width: options.width ?? 1440 });
   if (options.preferences) {
-    helios.persistence.preferences = {
-      ...helios.persistence.preferences,
+    helios.storage.preferences = {
+      ...helios.storage.preferences,
       ...options.preferences,
       responsive: {
-        ...helios.persistence.preferences.responsive,
+        ...helios.storage.preferences.responsive,
         ...(options.preferences?.responsive ?? {}),
       },
     };
   }
-  helios.persistence.restorableSession = options.restorableSession ?? null;
+  helios.storage.restorableSession = options.restorableSession ?? null;
   const registry = new BehaviorRegistry().register('interface', InterfaceBehavior);
   const manager = new BehaviorManager(helios, registry);
   manager.setUI(helios.ui);
@@ -144,7 +176,7 @@ test('interface behavior attaches and exposes dock-side public accessors', async
   behavior.dockSide('right');
 
   assert.equal(behavior.dockSide(), 'right');
-  assert.equal(helios.persistence.calls.updatePreferences.at(-1).responsive.compactDockSide, 'right');
+  assert.equal(helios.storage.calls.updatePreferences.at(-1).responsive.compactDockSide, 'right');
 });
 
 test('interface behavior can switch compact dock side back from right to left', async () => {
@@ -155,7 +187,7 @@ test('interface behavior can switch compact dock side back from right to left', 
   behavior.dockSide('left');
 
   assert.equal(behavior.dockSide(), 'left');
-  assert.equal(helios.persistence.calls.updatePreferences.at(-1).responsive.compactDockSide, 'left');
+  assert.equal(helios.storage.calls.updatePreferences.at(-1).responsive.compactDockSide, 'left');
 });
 
 test('interface behavior transitions across desktop, compact, and fullscreen breakpoints', async () => {
@@ -256,11 +288,65 @@ test('interface behavior surfaces unfinished-session resume prompts and can resu
 
   const restored = await behavior.resumeSession({ markFinished: false });
   assert.deepEqual(restored, { restored: 'session-42' });
-  assert.deepEqual(helios.persistence.calls.restoreSession, [{
+  assert.deepEqual(helios.storage.calls.resumeSession, [{
     id: 'session-42',
     options: { markFinished: false },
   }]);
   assert.equal(behavior.resumePrompt(), null);
+});
+
+test('interface behavior does not serialize resume prompts as durable UI state', async () => {
+  const { behavior } = attachInterfaceBehavior({
+    restorableSession: {
+      payload: {
+        session: { id: 'session-ephemeral', updatedAt: 1234 },
+        networkSource: { name: 'ephemeral.xnet', format: 'xnet' },
+      },
+    },
+  });
+  await behavior.ensurePersistenceReady();
+
+  assert.equal(behavior.resumePrompt().sessionId, 'session-ephemeral');
+  assert.equal(behavior.serializeInterfaceState().resumePrompt, null);
+  assert.equal(behavior.serializeInterfaceState({ includeResumePrompt: true }).resumePrompt.sessionId, 'session-ephemeral');
+});
+
+test('interface behavior ignores stale serialized resume prompts for explicit URL sessions', async () => {
+  const { helios, behavior } = attachInterfaceBehavior();
+  helios.storage.requestedSessionId = 'valid-session';
+  helios.storage.explicitSessionInvalid = false;
+
+  behavior.restoreInterfaceState({
+    resumePrompt: {
+      visible: true,
+      sessionId: 'stale-session',
+      status: 'prompt',
+      updatedAt: 1234,
+      networkSource: { name: 'old.xnet' },
+    },
+  });
+
+  assert.equal(behavior.resumePrompt(), null);
+  assert.equal(helios.ui.applied.at(-1).resumePrompt, null);
+});
+
+test('interface behavior does not ask for resume when an explicit session is valid', async () => {
+  const { helios, behavior } = attachInterfaceBehavior({
+    restorableSession: {
+      payload: {
+        session: { id: 'other-session', updatedAt: 1234 },
+        networkSource: { name: 'other.xnet' },
+      },
+    },
+  });
+  helios.storage.requestedSessionId = 'valid-session';
+  helios.storage.explicitSessionInvalid = false;
+
+  await behavior.ensurePersistenceReady();
+
+  assert.equal(behavior.resumePrompt(), null);
+  assert.equal(helios.storage.calls.getResumePrompt, 0);
+  assert.equal(helios.ui.applied.at(-1).resumePrompt, null);
 });
 
 test('interface behavior can start fresh from a pending unfinished session prompt', async () => {
@@ -275,7 +361,23 @@ test('interface behavior can start fresh from a pending unfinished session promp
   await behavior.ensurePersistenceReady();
   await behavior.startFresh();
 
-  assert.deepEqual(helios.persistence.calls.markSessionFinished, ['session-9']);
+  assert.deepEqual(helios.storage.calls.markSessionFinished, []);
+  assert.equal(behavior.resumePrompt(), null);
+});
+
+test('interface behavior can explicitly mark a pending session finished when starting fresh', async () => {
+  const { helios, behavior } = attachInterfaceBehavior({
+    restorableSession: {
+      payload: {
+        session: { id: 'session-finish', updatedAt: 9876 },
+        networkSource: { name: 'stale.xnet', format: 'xnet' },
+      },
+    },
+  });
+  await behavior.ensurePersistenceReady();
+  await behavior.startFresh({ markFinished: true });
+
+  assert.deepEqual(helios.storage.calls.markSessionFinished, ['session-finish']);
   assert.equal(behavior.resumePrompt(), null);
 });
 

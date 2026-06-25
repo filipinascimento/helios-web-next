@@ -23,7 +23,15 @@ function subpanelForHeader(header) {
   return header.locator('xpath=ancestor::*[contains(concat(" ", normalize-space(@class), " "), " helios-ui-subpanel ")][1]');
 }
 
-test.describe('docs basic demo metrics panel', () => {
+async function expandPanel(panel) {
+  await expect(panel).toBeVisible();
+  if ((await panel.getAttribute('data-collapsed')) === 'true') {
+    await panel.locator('.helios-ui-panel__actions .helios-ui-button').first().click();
+  }
+  await expect(panel).toHaveAttribute('data-collapsed', 'false');
+}
+
+test.describe('docs main app metrics panel', () => {
   test('can start and cancel worker metrics run', async ({ page }, testInfo) => {
     await page.goto('/?renderer=webgl&layout=none&mode=2d&nodes=6000');
 
@@ -31,7 +39,7 @@ test.describe('docs basic demo metrics panel', () => {
     await page.waitForFunction(() => Boolean(window.__heliosUI));
 
     const panel = page.locator('.helios-ui-panel[data-panel-id="helios-ui-metrics"]');
-    await expect(panel).toBeVisible();
+    await expandPanel(panel);
 
     const leidenHeader = panel.locator('button.helios-ui-subpanel__header', { hasText: 'Communities (Leiden)' });
     const leidenItem = subpanelForHeader(leidenHeader);
@@ -93,7 +101,7 @@ test.describe('docs basic demo metrics panel', () => {
     await page.waitForFunction(() => Boolean(window.__heliosUI));
 
     const panel = page.locator('.helios-ui-panel[data-panel-id="helios-ui-metrics"]');
-    await expect(panel).toBeVisible();
+    await expandPanel(panel);
 
     const dimHeader = panel.locator('button.helios-ui-subpanel__header', { hasText: 'Dimensionality' });
     const dimItem = subpanelForHeader(dimHeader);
@@ -116,6 +124,8 @@ test.describe('docs basic demo metrics panel', () => {
     await panel.locator('[data-testid="metrics-dimension-chunkBudget"]').fill('100');
     await panel.locator('[data-testid="metrics-dimension-outMaxAttr"]').fill('dim_max_test');
     const saveLevels = panel.locator('[data-testid="metrics-dimension-saveLevels"]');
+    await expect(saveLevels).toHaveAttribute('role', 'switch');
+    await expect(saveLevels.locator('.helios-ui-toggle__text')).toHaveText(/On|Off/);
     await ensureToggleOn(saveLevels);
     await panel.locator('[data-testid="metrics-dimension-outLevelsAttr"]').fill('dim_levels_test');
     await panel.locator('[data-testid="metrics-dimension-levelsEncoding"]').selectOption('string');
@@ -170,7 +180,7 @@ test.describe('docs basic demo metrics panel', () => {
     await page.waitForFunction(() => Boolean(window.__heliosUI));
 
     const panel = page.locator('.helios-ui-panel[data-panel-id="helios-ui-metrics"]');
-    await expect(panel).toBeVisible();
+    await expandPanel(panel);
 
     const openSubpanel = async (title) => {
       const header = panel.locator('button.helios-ui-subpanel__header', { hasText: title });
@@ -256,6 +266,9 @@ test.describe('docs basic demo metrics panel', () => {
       await betweennessAdvancedHeader.click();
     }
     await panel.locator('[data-testid="metrics-betweenness-weight"]').selectOption('');
+    const normalizeBetweenness = panel.locator('[data-testid="metrics-betweenness-normalize"]');
+    await expect(normalizeBetweenness).toHaveAttribute('role', 'switch');
+    await expect(normalizeBetweenness.locator('.helios-ui-toggle__text')).toHaveText(/On|Off/);
     await panel.locator('[data-testid="metrics-betweenness-outAttr"]').fill('betweenness_test');
     await panel.locator('[data-testid="metrics-betweenness-calc"]').click();
 
@@ -270,6 +283,11 @@ test.describe('docs basic demo metrics panel', () => {
     await expect(clusteringStatus).toHaveText(/Done|not available/i);
     await expect(eigenStatus).toHaveText(/Done|not available/i);
     await expect(betweennessStatus).toHaveText(/Done|not available/i);
+    await expect.poll(() => page.evaluate(() => (
+      window.__helios.states?.status?.('metrics', { mode: 'scope' })?.state ?? 'default'
+    )), { timeout: 10000 }).not.toBe('default');
+    await expect(panel.locator('.helios-ui-panel__persistence-indicator[data-path="metrics"]').first())
+      .not.toHaveAttribute('data-state', 'default');
 
     const snapshot = await page.evaluate(() => {
       const net = window.__helios?.network;
@@ -323,6 +341,10 @@ test.describe('docs basic demo metrics panel', () => {
           eigenvector: values.eigenvector,
           betweenness: values.betweenness,
         },
+        storage: {
+          metricsStatus: window.__helios?.states?.status?.('metrics', { mode: 'scope' }) ?? null,
+          lastMetricOutput: window.__helios?.states?.get?.('metrics.lastOutput') ?? null,
+        },
       };
     });
 
@@ -351,5 +373,7 @@ test.describe('docs basic demo metrics panel', () => {
       expect(snapshot.attrs.betweenness).toBeTruthy();
       expect(Number.isFinite(snapshot.values.betweenness)).toBeTruthy();
     }
+    expect(snapshot.storage.metricsStatus?.state).not.toBe('default');
+    expect(snapshot.storage.lastMetricOutput?.attributes?.length ?? 0).toBeGreaterThan(0);
   });
 });

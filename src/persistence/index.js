@@ -5,6 +5,9 @@ export {
   createDefaultUIState,
   createDefaultNetworkSource,
   createPersistenceEnvelope,
+  applyOverridesToVisualizationState,
+  diffOverrideMaps,
+  flattenVisualizationOverrides,
   migratePersistenceEnvelope,
   parsePersistenceEnvelope,
   serializePersistenceEnvelope,
@@ -15,12 +18,3 @@ export {
   createMemoryIndexedDBFactory,
   createMemoryStorage,
 } from './storage.js';
-export {
-  HeliosSessionController,
-  applyOverridesToVisualizationState,
-  diffOverrideMaps,
-  flattenVisualizationOverrides,
-} from './HeliosSessionController.js';
-export { default as HeliosSessionControllerDefault } from './HeliosSessionController.js';
-export { HeliosPersistenceService } from './HeliosPersistenceService.js';
-export { default as HeliosPersistenceServiceDefault } from './HeliosPersistenceService.js';

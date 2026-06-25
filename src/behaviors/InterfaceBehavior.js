@@ -313,7 +313,8 @@ export class InterfaceBehavior extends Behavior {
     return this;
   }
 
-  serializeInterfaceState() {
+  serializeInterfaceState(options = {}) {
+    const includeResumePrompt = options.includeResumePrompt === true;
     return {
       dockSide: this.state.dockSide,
       mode: this.state.mode,
@@ -321,13 +322,7 @@ export class InterfaceBehavior extends Behavior {
       controlsOpen: this.state.mode === 'fullscreen' ? this.state.controlsOpen : false,
       activePanelId: this.state.mode === 'fullscreen' ? this.state.activePanelId : null,
       focused: this.state.mode === 'fullscreen' ? this.state.focused : false,
-      resumePrompt: this.state.resumePrompt ? {
-        sessionId: this.state.resumePrompt.sessionId,
-        visible: this.state.resumePrompt.visible,
-        status: this.state.resumePrompt.status,
-        updatedAt: this.state.resumePrompt.updatedAt,
-        networkSource: cloneSerializable(this.state.resumePrompt.networkSource),
-      } : null,
+      resumePrompt: includeResumePrompt ? this.resumePrompt() : null,
     };
   }
 
@@ -336,6 +331,10 @@ export class InterfaceBehavior extends Behavior {
       ...this.state,
       ...(snapshot && typeof snapshot === 'object' ? snapshot : {}),
     });
+    const storage = this.context?.helios?.storage ?? null;
+    const shouldShowRestorePrompt = storage?.capabilities?.sessions === true
+      && !storage.requestedSessionId;
+    const restoredPrompt = shouldShowRestorePrompt ? next.resumePrompt : null;
     const modeFromViewport = resolveMode(this.context?.ui?.getViewportWidth?.() ?? next.viewportWidth, this.options);
     this.state = {
       ...next,
@@ -343,6 +342,7 @@ export class InterfaceBehavior extends Behavior {
       controlsOpen: modeFromViewport === 'fullscreen' ? next.controlsOpen : false,
       activePanelId: modeFromViewport === 'fullscreen' ? next.activePanelId : null,
       focused: modeFromViewport === 'fullscreen' ? next.focused : false,
+      resumePrompt: restoredPrompt,
     };
     this._applyToUI();
     this.emitChange('restore-interface', this.serializeInterfaceState());
@@ -356,11 +356,11 @@ export class InterfaceBehavior extends Behavior {
   }
 
   async _loadPersistenceState() {
-    const persistence = this.context?.helios?.persistence ?? null;
-    if (!persistence) return null;
+    const storage = this.context?.helios?.storage ?? null;
+    if (!storage) return null;
 
-    if (!this._preferencesLoaded && typeof persistence.loadPreferences === 'function') {
-      const preferences = await persistence.loadPreferences();
+    if (!this._preferencesLoaded && typeof storage?.loadPreferences === 'function') {
+      const preferences = await storage.loadPreferences();
       this._preferencesLoaded = true;
       const persistedDockSide = preferences?.responsive?.compactDockSide;
       if (persistedDockSide === 'left' || persistedDockSide === 'right') {
@@ -368,18 +368,21 @@ export class InterfaceBehavior extends Behavior {
       }
     }
 
-    if (this.options.restorePrompt !== false && typeof persistence.getRestorableSession === 'function') {
-      const session = await persistence.getRestorableSession();
-      if (session?.payload?.session?.id) {
+    const shouldShowRestorePrompt = storage?.capabilities?.sessions === true
+      && !storage.requestedSessionId;
+    if (!shouldShowRestorePrompt && this.state.resumePrompt) {
+      this.state = {
+        ...this.state,
+        resumePrompt: null,
+      };
+    }
+    const promptSource = storage;
+    if (shouldShowRestorePrompt && this.options.restorePrompt !== false && typeof promptSource?.getResumePrompt === 'function') {
+      const prompt = await promptSource.getResumePrompt({ limit: this.options.restorePromptLimit ?? 8 });
+      if (prompt?.sessionId) {
         this.state = {
           ...this.state,
-          resumePrompt: {
-            visible: true,
-            sessionId: session.payload.session.id,
-            status: 'prompt',
-            updatedAt: session.payload.session.updatedAt ?? null,
-            networkSource: cloneSerializable(session.payload.networkSource),
-          },
+          resumePrompt: cloneSerializable(prompt),
         };
       }
     }
@@ -393,8 +396,8 @@ export class InterfaceBehavior extends Behavior {
   }
 
   async persistResponsivePreferences(options = {}) {
-    const persistence = this.context?.helios?.persistence ?? null;
-    if (!persistence?.updatePreferences) return null;
+    const storage = this.context?.helios?.storage ?? null;
+    if (!storage?.updatePreferences) return null;
     const patch = {
       responsive: {
         compactDockSide: this.state.dockSide,
@@ -405,8 +408,9 @@ export class InterfaceBehavior extends Behavior {
       patch.responsive.preferredMode = this.state.mode === 'desktop' ? null : this.state.mode;
     }
     try {
-      return await persistence.updatePreferences(patch);
-    } catch {
+      return await storage.updatePreferences(patch);
+    } catch (error) {
+      console.warn('Helios interface preferences failed to persist.', error);
       return null;
     }
   }
@@ -417,24 +421,19 @@ export class InterfaceBehavior extends Behavior {
 
   async resumeSession(options = {}) {
     const prompt = this.state.resumePrompt;
-    const persistence = this.context?.helios?.persistence ?? null;
-    if (!prompt?.sessionId || !persistence?.restoreSession) return null;
-    this.state = {
-      ...this.state,
-      resumePrompt: {
-        ...prompt,
-        status: 'restoring',
-      },
-    };
-    this._applyToUI();
-    const restored = await persistence.restoreSession(prompt.sessionId, options);
+    const storage = this.context?.helios?.storage ?? null;
+    const sessionId = options.sessionId ?? prompt?.sessionId ?? null;
+    const sessionSource = storage;
+    if (!sessionId || (!sessionSource?.resumeSession && !sessionSource?.restoreSession)) return null;
     this.state = {
       ...this.state,
       resumePrompt: null,
     };
     this._applyToUI();
+    const restored = await (sessionSource.resumeSession?.(sessionId, options)
+      ?? sessionSource.restoreSession?.(sessionId, options));
     this.emitChange('resume-session', {
-      sessionId: prompt.sessionId,
+      sessionId,
       restored: restored != null,
     });
     return restored;
@@ -442,12 +441,14 @@ export class InterfaceBehavior extends Behavior {
 
   async startFresh(options = {}) {
     const prompt = this.state.resumePrompt;
-    const persistence = this.context?.helios?.persistence ?? null;
-    if (prompt?.sessionId && persistence) {
-      if (options.delete === true && typeof persistence.deleteSession === 'function') {
-        await persistence.deleteSession(prompt.sessionId);
-      } else if (typeof persistence.markSessionFinished === 'function') {
-        await persistence.markSessionFinished(prompt.sessionId);
+    const storage = this.context?.helios?.storage ?? null;
+    this._persistenceReady = Promise.resolve(true);
+    if (prompt?.sessionId && storage) {
+      const sessionSource = storage;
+      if ((options.delete === true || options.deletePendingSession === true)) {
+        await sessionSource?.deleteSession?.(prompt.sessionId);
+      } else if (options.markFinished === true) {
+        await sessionSource?.markSessionFinished?.(prompt.sessionId);
       }
     }
     this.state = {

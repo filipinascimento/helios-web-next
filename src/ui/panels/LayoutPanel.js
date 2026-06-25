@@ -4,6 +4,7 @@ import { createAlignedRowEl } from '../controls/createAlignedRowEl.js';
 import { createDirtyIndicator } from '../controls/createDirtyIndicator.js';
 import { SuggestedSliderControls } from '../controls/SuggestedSliderControls.js';
 import { LogSliderControls } from '../controls/LogSliderControls.js';
+import { LAYOUT_PANEL_SCHEMA, humanizeControlLabel } from './panelSchema.js';
 
 const CURRENT_POSITION_ATTRIBUTE = '_helios_visuals_position';
 
@@ -66,10 +67,37 @@ function usesLogScale(binding) {
   return binding?.scale === 'log';
 }
 
-function scopeForPersistencePath(path) {
+function scopeForStatePath(path) {
   const parts = String(path ?? '').split('.').filter(Boolean);
   if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
   return parts[0] ?? '';
+}
+
+function collectStateKeys(detail = {}) {
+  const keys = [];
+  if (typeof detail.storageKey === 'string') keys.push(detail.storageKey);
+  if (typeof detail.stateKey === 'string') keys.push(detail.stateKey);
+  if (Array.isArray(detail.storageKeys)) {
+    for (const key of detail.storageKeys) if (typeof key === 'string') keys.push(key);
+  }
+  if (Array.isArray(detail.stateKeys)) {
+    for (const key of detail.stateKeys) if (typeof key === 'string') keys.push(key);
+  }
+  return keys;
+}
+
+function stateKeyMatchesTarget(key, target) {
+  if (!key || !target) return false;
+  return key === target || key.startsWith(`${target}.`) || target.startsWith(`${key}.`);
+}
+
+function layoutEventTargetsPath(detail = {}, path = '') {
+  const keys = collectStateKeys(detail);
+  if (!keys.length) return false;
+  return keys.some((key) => (
+    stateKeyMatchesTarget(key, path)
+    || stateKeyMatchesTarget(key, `behaviors.${path}`)
+  ));
 }
 
 function formatInputNumber(value, binding) {
@@ -205,6 +233,8 @@ export class LayoutPanel {
     const helios = this.ui.helios ?? null;
     const content = document.createElement('div');
     const layoutBehavior = helios?.behavior?.layout ?? helios?.useBehavior?.('layout');
+    const storage = helios?.storage ?? null;
+    const stateManager = helios?.states ?? storage;
 
     if (!helios || !layoutBehavior) {
       const placeholder = document.createElement('div');
@@ -225,11 +255,18 @@ export class LayoutPanel {
     }
 
     const controlsByKey = new Map();
+    const parameterEntryCleanups = new Map();
     const staticIndicatorCleanups = new Set();
     let currentDescriptorKey = null;
     let lastChoiceSignature = null;
     let lastPositionChoiceSignature = null;
     let selectedPositionAttribute = layoutBehavior.positionAttribute?.() ?? CURRENT_POSITION_ATTRIBUTE;
+    const getCurrentDescriptor = () => layoutBehavior.descriptor?.() ?? {
+      key: 'static',
+      label: 'Static',
+      dynamic: false,
+      bindings: [],
+    };
 
     const layoutSelect = document.createElement('select');
     layoutSelect.className = 'helios-ui-select';
@@ -287,13 +324,128 @@ export class LayoutPanel {
     let statusHistory = [];
     let lastStatusSampleAt = Number.NEGATIVE_INFINITY;
 
-    const createPersistenceIndicator = (path = '', scope = null) => {
+    const persistenceScopeForLayoutPath = (path, fallback = 'network') => (
+      path === 'layout.running' ? 'session' : fallback
+    );
+    const storageEntryForKey = (path) => stateManager?.entry?.(path) ?? null;
+    const storageValueForKey = (path, fallback = null) => {
+      const entry = storageEntryForKey(path);
+      const value = stateManager?.get?.(path, undefined);
+      return value === undefined ? (entry?.default ?? fallback) : value;
+    };
+    const bindingTypeForStorage = (binding) => {
+      if (binding?.type === 'boolean') return 'boolean';
+      if (binding?.type === 'select') return 'string';
+      if (binding?.type === 'number') return 'number';
+      return 'object';
+    };
+    const bindingLabel = (binding) => (
+      (typeof binding?.label === 'string' && binding.label.trim())
+        ? binding.label.trim()
+        : humanizeControlLabel(binding?.key)
+    );
+    const bindingUiForStorage = (binding) => ({
+      label: bindingLabel(binding),
+      controller: binding?.type === 'select'
+        ? 'select'
+        : (binding?.type === 'boolean' ? 'toggle' : (binding?.type === 'number' ? 'slider' : 'auto')),
+      min: binding?.min ?? binding?.sliderMin ?? null,
+      max: binding?.max ?? binding?.sliderMax ?? null,
+      step: binding?.step ?? binding?.inputStep ?? null,
+      inputMin: binding?.inputMin ?? null,
+      inputMax: Object.prototype.hasOwnProperty.call(binding ?? {}, 'inputMax') ? binding.inputMax : null,
+      sliderMin: binding?.sliderMin ?? null,
+      sliderMax: binding?.sliderMax ?? null,
+      scale: binding?.scale ?? null,
+      options: binding?.options ?? null,
+      debounceMs: 220,
+    });
+    const registerLayoutPersistenceKey = (path, options = {}) => {
+      if (storageEntryForKey(path)) return null;
+      const scope = options.persistenceScope ?? options.scope ?? persistenceScopeForLayoutPath(path);
+      const debounceMs = options.debounceMs ?? (path.startsWith('layout.parameters.') ? 220 : 150);
+      const registerOptions = {
+        scope,
+        debounceMs,
+        metadata: options.metadata ?? {},
+      };
+      if (Object.prototype.hasOwnProperty.call(options, 'defaultValue')) {
+        registerOptions.defaultValue = options.defaultValue;
+      }
+      return this.ui.registerStateControl?.(path, registerOptions)
+        ?? this.ui._registerStateKey?.(path, registerOptions);
+    };
+    const createStateIndicator = (path = '', indicatorScope = null, options = {}) => {
       if (this.ui.persistenceIndicators === false) return null;
-      return createDirtyIndicator({
-        helios,
-        path,
-        scope: scope ?? scopeForPersistencePath(path),
+      if (path) registerLayoutPersistenceKey(path, options);
+      const resolvedIndicatorScope = indicatorScope ?? scopeForStatePath(path);
+      return this.ui.createStateIndicator?.(path, resolvedIndicatorScope, { register: false })
+        ?? createDirtyIndicator({
+          helios,
+          path,
+          scope: resolvedIndicatorScope,
       });
+    };
+    const persistLayoutValue = (path, value, options = {}) => {
+      const scope = options.scope ?? persistenceScopeForLayoutPath(path);
+      const debounceMs = options.debounceMs ?? (path.startsWith('layout.parameters.') ? 220 : 150);
+      if (typeof stateManager?.set === 'function' && storageEntryForKey(path)) {
+        stateManager.set(path, value, {
+          scope,
+          source: 'ui',
+          reason: options.reason ?? 'layout-control',
+          journal: false,
+        });
+        return;
+      }
+      registerLayoutPersistenceKey(path, { scope, debounceMs, metadata: options.metadata ?? {} });
+      const writer = this.ui.writeStateControl ?? this.ui._writeStateValue;
+      writer?.call(this.ui, path, value, {
+        scope,
+        source: 'ui',
+        reason: options.reason ?? 'layout-control',
+        debounceMs,
+      });
+    };
+    const registerLayoutParameterEntry = (binding) => {
+      const key = typeof binding?.key === 'string' ? binding.key.trim() : '';
+      if (!key || !stateManager || typeof stateManager.register !== 'function') return null;
+      const path = `layout.parameters.${key}`;
+      if (storageEntryForKey(path)) return null;
+      const cleanup = stateManager.register(this, 'behaviors.layout', {
+        [`parameters.${key}`]: {
+          description: binding.hint ?? `Layout parameter ${key}.`,
+          default: binding.get?.(),
+          type: bindingTypeForStorage(binding),
+          scope: 'workspace',
+          aliases: [path],
+          ui: bindingUiForStorage(binding),
+          getter: () => layoutBehavior.parameter?.(key),
+          setter: (value) => layoutBehavior.parameter?.(key, value, { silent: true }),
+          subscribe: (notify) => layoutBehavior.on?.('change', (event) => {
+            const detail = event?.detail ?? {};
+            const changedKey = detail.key ?? null;
+            const changedKeys = Array.isArray(detail.keys) ? detail.keys : [];
+            if (changedKey && changedKey !== key) return;
+            if (changedKeys.length && !changedKeys.includes(key)) return;
+            if (!changedKey && !changedKeys.length && !layoutEventTargetsPath(detail, path)) return;
+            notify(undefined, detail);
+          }),
+        },
+      });
+      if (typeof cleanup === 'function') parameterEntryCleanups.set(path, cleanup);
+      if (stateManager.status?.(path, { ignorePersistence: true })?.hasOverride === true) {
+        const restored = storageValueForKey(path, undefined);
+        if (restored !== undefined) layoutBehavior.parameter?.(key, restored, { silent: true });
+      }
+      return cleanup;
+    };
+    const syncLayoutParameterEntries = (descriptor) => {
+      for (const binding of descriptor?.bindings ?? []) {
+        const key = typeof binding?.key === 'string' ? binding.key.trim() : '';
+        if (!key || binding.type === 'display') continue;
+        registerLayoutParameterEntry(binding);
+      }
     };
 
     const trackStaticIndicator = (indicator) => {
@@ -304,7 +456,9 @@ export class LayoutPanel {
     const layoutRow = createAlignedRowEl({
       title: 'Layout',
       controls: layoutSelect,
-      dirtyIndicator: trackStaticIndicator(createPersistenceIndicator('layout.layoutType', 'layout')),
+      dirtyIndicator: trackStaticIndicator(createStateIndicator('layout.layoutType', 'layout', {
+        defaultValue: storageEntryForKey('layout.layoutType')?.default ?? getCurrentDescriptor().key,
+      })),
     });
     content.appendChild(layoutRow.row);
 
@@ -312,14 +466,17 @@ export class LayoutPanel {
       title: 'Set from',
       hint: 'Copies a numeric 2D/3D node attribute into the current layout positions.',
       controls: positionAttributeSelect,
-      dirtyIndicator: trackStaticIndicator(createPersistenceIndicator('layout.positionAttribute', 'layout')),
+      dirtyIndicator: null,
     });
     content.appendChild(sourceRow.row);
 
     const runRow = createAlignedRowEl({
       title: 'Status',
       controls: statusControls,
-      dirtyIndicator: trackStaticIndicator(createPersistenceIndicator('layout.running', 'layout')),
+      dirtyIndicator: trackStaticIndicator(createStateIndicator('layout.running', 'layout', {
+        persistenceScope: 'session',
+        defaultValue: storageEntryForKey('layout.running')?.default ?? ((layoutBehavior.runState?.() ?? 'stopped') !== 'stopped'),
+      })),
     });
     content.appendChild(runRow.row);
     content.appendChild(bindingsRoot);
@@ -329,15 +486,9 @@ export class LayoutPanel {
       title: this.options.title ?? 'Layout',
       position: this.options.position ?? { x: 16, y: 360 },
       dock: this.options.dock ?? 'top-right',
+      panelSchema: LAYOUT_PANEL_SCHEMA,
       content,
     });
-
-    const getCurrentDescriptor = () => layoutBehavior.descriptor?.() ?? {
-      key: 'static',
-      label: 'Static',
-      dynamic: false,
-      bindings: [],
-    };
 
     const syncLayoutChoices = () => {
       const descriptor = getCurrentDescriptor();
@@ -440,18 +591,33 @@ export class LayoutPanel {
 
     const commitBindingValue = (binding, value) => {
       if (!binding) return;
-      if (binding.key && typeof layoutBehavior.parameter === 'function') {
-        layoutBehavior.parameter(binding.key, value, { silent: true });
-      } else if (typeof binding.set === 'function') {
-        binding.set(value);
+      const parameterPath = binding.key ? `layout.parameters.${binding.key}` : null;
+      if (parameterPath && storageEntryForKey(parameterPath) && typeof stateManager?.set === 'function') {
+        stateManager.set(parameterPath, value, {
+          source: 'ui',
+          reason: 'layout-parameter',
+          journal: false,
+        });
       } else {
-        return;
+        if (binding.key && typeof layoutBehavior.parameter === 'function') {
+          layoutBehavior.parameter(binding.key, value, { silent: true });
+        } else if (typeof binding.set === 'function') {
+          binding.set(value);
+        } else {
+          return;
+        }
+        layoutBehavior.emitChange?.('parameter', {
+          key: binding.key ?? null,
+          value,
+          source: 'ui',
+        });
+        if (binding.key) {
+          persistLayoutValue(`layout.parameters.${binding.key}`, value, {
+            reason: 'layout-parameter',
+            metadata: { parameter: binding.key },
+          });
+        }
       }
-      layoutBehavior.emitChange?.('parameter', {
-        key: binding.key ?? null,
-        value,
-        source: 'ui',
-      });
       const descriptor = getCurrentDescriptor();
       const runState = layoutBehavior.runState?.() ?? 'stopped';
       if (descriptor.dynamic === true && runState !== 'stopped') {
@@ -489,6 +655,11 @@ export class LayoutPanel {
       let sample = null;
       let destroy = () => {};
       let dirtyIndicator = null;
+      const parameterPath = binding.key ? `layout.parameters.${binding.key}` : null;
+      const createParameterIndicator = () => (parameterPath
+        ? createStateIndicator(parameterPath, 'layout.parameters', { defaultValue: binding.get?.() })
+        : null);
+      if (parameterPath) registerLayoutParameterEntry(binding);
 
       if (binding.type === 'display') {
         const wrap = document.createElement('div');
@@ -546,12 +717,13 @@ export class LayoutPanel {
           };
         }
       } else if (binding.type === 'boolean') {
-        dirtyIndicator = createPersistenceIndicator(`layout.parameters.${binding.key}`, 'layout.parameters');
+        dirtyIndicator = createParameterIndicator();
+        const label = bindingLabel(binding);
         const toggle = createToggleControl({
           checked: Boolean(binding.get?.()),
           onLabel: 'On',
           offLabel: 'Off',
-          ariaLabel: binding.label ?? binding.key,
+          ariaLabel: label,
         });
         toggle.addEventListener('change', () => {
           commitBindingValue(binding, toggle.checked);
@@ -562,9 +734,10 @@ export class LayoutPanel {
           toggle.checked = Boolean(binding.get?.());
         };
       } else if (binding.type === 'select') {
-        dirtyIndicator = createPersistenceIndicator(`layout.parameters.${binding.key}`, 'layout.parameters');
+        dirtyIndicator = createParameterIndicator();
         const select = document.createElement('select');
         select.className = 'helios-ui-select';
+        select.setAttribute('aria-label', bindingLabel(binding));
         for (const entry of binding.options ?? []) {
           const option = document.createElement('option');
           option.value = String(entry.value);
@@ -581,7 +754,7 @@ export class LayoutPanel {
           if (select.value !== nextValue) select.value = nextValue;
         };
       } else {
-        dirtyIndicator = createPersistenceIndicator(`layout.parameters.${binding.key}`, 'layout.parameters');
+        dirtyIndicator = createParameterIndicator();
         const wrap = document.createElement('div');
         const sliderMin = resolveFiniteBound(binding.sliderMin, binding.min);
         const sliderMax = resolveFiniteBound(binding.sliderMax, binding.max);
@@ -663,7 +836,7 @@ export class LayoutPanel {
       }
 
       const row = createAlignedRowEl({
-        title: binding.label ?? binding.key,
+        title: bindingLabel(binding),
         hint: binding.hint ?? null,
         controls,
         dirtyIndicator,
@@ -683,6 +856,7 @@ export class LayoutPanel {
     const rebuildBindings = () => {
       const descriptor = getCurrentDescriptor();
       currentDescriptorKey = descriptor.key;
+      syncLayoutParameterEntries(descriptor);
       for (const control of controlsByKey.values()) {
         control.destroy?.();
       }
@@ -718,6 +892,11 @@ export class LayoutPanel {
         layoutBehavior.start?.();
         selectedPositionAttribute = CURRENT_POSITION_ATTRIBUTE;
       }
+      persistLayoutValue('layout.running', !(state === 'running' || state === 'idle'), {
+        scope: 'session',
+        debounceMs: 0,
+        reason: 'layout-running',
+      });
       sync(false);
     };
 
@@ -782,8 +961,16 @@ export class LayoutPanel {
 
     layoutSelect.addEventListener('change', () => {
       layoutBehavior.type?.(layoutSelect.value);
+      persistLayoutValue('layout.layoutType', layoutSelect.value, {
+        reason: 'layout-type',
+      });
       if (layoutSelect.value === 'static') {
         layoutBehavior.stop?.('ui:layout-panel');
+        persistLayoutValue('layout.running', false, {
+          scope: 'session',
+          debounceMs: 0,
+          reason: 'layout-running',
+        });
       } else if ((layoutBehavior.runState?.() ?? 'stopped') !== 'stopped') {
         selectedPositionAttribute = CURRENT_POSITION_ATTRIBUTE;
       }
@@ -822,6 +1009,8 @@ export class LayoutPanel {
           control.destroy?.();
         }
         controlsByKey.clear();
+        for (const cleanup of parameterEntryCleanups.values()) cleanup?.();
+        parameterEntryCleanups.clear();
         for (const cleanup of staticIndicatorCleanups) cleanup?.();
         staticIndicatorCleanups.clear();
         originalDestroy();

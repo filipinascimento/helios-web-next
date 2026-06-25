@@ -13,6 +13,15 @@ function stateForPath(dirtyState, path, scope = path, mode = 'control') {
   return 'default';
 }
 
+function resolvePersistenceState(helios, path, scope, mode) {
+  const stateManager = helios?.states ?? null;
+  if (typeof stateManager?.status === 'function') {
+    return stateManager.status(mode === 'scope' ? (scope || path) : path, { scope, mode })?.state ?? 'default';
+  }
+  const dirtyState = stateManager?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} };
+  return stateForPath(dirtyState, path, scope, mode);
+}
+
 function closeOpenMenus(root = document) {
   for (const menu of root.querySelectorAll?.('.helios-ui-dirty-menu') ?? []) {
     menu.remove();
@@ -36,6 +45,11 @@ export function createDirtyIndicator({
   indicator.setAttribute('aria-label', 'Persistence status');
   const hasPath = Boolean(normalizePath(path));
   if (hasPath) {
+    indicator.dataset.path = normalizePath(path);
+    indicator.dataset.scope = normalizePath(scope || path);
+    indicator.dataset.mode = mode === 'scope' ? 'scope' : 'control';
+  }
+  if (hasPath) {
     indicator.setAttribute('role', 'button');
     indicator.setAttribute('tabindex', '0');
     indicator.setAttribute('aria-haspopup', 'menu');
@@ -46,8 +60,7 @@ export function createDirtyIndicator({
   }
 
   const update = () => {
-    const dirtyState = helios?.persistence?.getDirtyState?.() ?? { controls: {}, sections: {}, panels: {} };
-    indicator.dataset.state = stateForPath(dirtyState, path, scope, mode);
+    indicator.dataset.state = resolvePersistenceState(helios, path, scope, mode);
   };
 
   const buildMenu = () => {
@@ -73,7 +86,9 @@ export function createDirtyIndicator({
     };
 
     const resetTarget = normalizePath(mode === 'scope' ? (scope || path) : path);
-    addItem('Reset to default', () => helios?.persistence?.resetOverride?.(resetTarget), {
+    addItem('Reset to default', () => (
+      helios?.states?.reset?.(resetTarget)
+    ), {
       disabled: !resetTarget || indicator.dataset.state === 'default',
     });
 
@@ -110,13 +125,18 @@ export function createDirtyIndicator({
     buildMenu();
   });
 
-  const controller = helios?.persistence?.sessionController ?? null;
+  const stateManager = helios?.states ?? null;
   const onChange = () => update();
-  controller?.addEventListener?.('change', onChange);
-  controller?.addEventListener?.('config', onChange);
+  const stateTarget = normalizePath(mode === 'scope' ? (scope || path) : path);
+  const unsubscribeState = hasPath && typeof stateManager?.subscribe === 'function'
+    ? stateManager.subscribe(stateTarget, onChange, { immediate: false })
+    : null;
+  if (!unsubscribeState) stateManager?.addEventListener?.('change', onChange);
+  stateManager?.addEventListener?.('config', onChange);
   indicator.destroy = () => {
-    controller?.removeEventListener?.('change', onChange);
-    controller?.removeEventListener?.('config', onChange);
+    unsubscribeState?.();
+    if (!unsubscribeState) stateManager?.removeEventListener?.('change', onChange);
+    stateManager?.removeEventListener?.('config', onChange);
     closeOpenMenus(indicator.ownerDocument);
   };
   if (hasPath) attachTooltip?.(indicator, 'Shows whether this setting is tracked as a session override.');

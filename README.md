@@ -1,14 +1,21 @@
-# Helios Web Next
+<p align="center">
+  <img src="./media/helios-web-logo.svg" alt="Helios" width="320">
+</p>
 
-A fresh boilerplate for the next-generation Helios web renderer. It wires the
+# Helios Web
+
+The browser visualization package for Helios. It wires the
 [`helios-network`](https://www.npmjs.com/package/helios-network) WASM graph core
 into a layered rendering stack that targets WebGPU first with a WebGL2 fallback.
 
 ## Getting Started
 
 ```bash
+npm install helios-network helios-web
+
+# source checkout development
 npm install
-npm run dev    # serves the example under docs/examples/basic via Vite
+npm run dev    # serves the main app under docs/app via Vite
 npm run build  # produces the library bundle in dist/
 npm run test:e2e  # launches a headless smoke test (run `npx playwright install` once)
 npm run test:e2e:headed  # headed run of the full Playwright suite
@@ -19,7 +26,8 @@ npm run test    # runs the node colormap unit test
 ```
 
 Point your browser at `http://localhost:5173` to interact with the bundled
-example (located in `docs/examples/basic`). It creates a sample graph, applies
+main app (located in `docs/app`). It creates a 10k-node Watts-Strogatz
+sample graph by default, applies
 worker layout updates, and renders it through the indirect pipelines backed by
 `helios-network` sparse/indexed buffers so you can verify the stack end-to-end.
 
@@ -40,6 +48,30 @@ This gives tiny and dense graphs more visual separation without changing the
 physical force balance. Pass
 `layout.options.tuningModel = false` to restore the hand defaults, or pass a
 custom model function/object to override the bundled coefficients.
+For very large WebGPU layouts, `layout.options.layoutScheduling = 'auto'`
+switches to chunked layout dispatch above 500k active nodes. Chunked dispatch
+splits the node range across a bounded number of frames to reduce render queue stalls; use
+`'full'` to force the legacy one-step dispatch, or set
+`layoutChunkCount` to tune the number of chunks per full sweep.
+
+State and bindings are exposed through `helios.states`; sessions and durable
+sync are exposed through `helios.storage`. Plain library construction creates
+`helios.states` for live state and dummy storage for export/import snapshots.
+Dummy storage does not show persistent UI chrome.
+Pass `storage: { type: 'browser' }` with top-level `workspaceId` and `session`
+options, or pass a custom manager, when an app wants durable browser, remote,
+or host-managed sessions. Browser storage owns session save/list/load/delete
+through `helios.storage`; there is no separate `helios.session` facade.
+Ordinary UI controls bind to `helios.states` and update live visuals
+immediately; storage observes state changes and delays only durable sync work.
+Debug instrumentation is on by default for now: Helios exposes
+`window.__helios`, and UI-enabled apps append a right-docked Debug panel with
+recent state/UI/persistence counters. Pass `debug: false` to disable it.
+Portable network visualization snapshots are available through
+`helios.storage.serializeNetworkSnapshot()` and related helpers. See
+[`docs/persistence.md`](./docs/persistence.md) for the state/storage split,
+state-entry protocol, built-in panel schemas, marker aggregation, and storage
+migration notes.
 
 ## Using as a Library
 
@@ -48,13 +80,30 @@ The build artifact targets WebGPU first with WebGL2 as a fallback. After running
 
 ```js
 import HeliosNetwork from 'helios-network';
-import { Helios } from 'helios-web-next';
+import { Helios } from 'helios-web';
 
 const network = await HeliosNetwork.create();
 network.addNodes(5);
 
-const helios = new Helios(network, { container: '#app' });
+const helios = new Helios(network, {
+  container: '#app',
+  fileDrop: true,
+});
 await helios.ready;
+
+// Optional durable storage. Live controls still bind through helios.states.
+const persistentHelios = new Helios(network, {
+  container: '#app',
+  storage: { type: 'browser' },
+  workspaceId: 'demo-workspace',
+  session: {
+    id: 'demo-session',
+    url: true,
+    restore: true,
+  },
+  networkPersistence: { enabled: true, autosave: false },
+  positionPersistence: { enabled: true, autosave: true },
+});
 
 // Optional SVG labels overlay (regular labels stay off until enabled directly or by the Selection panel).
 helios.labels({
@@ -77,7 +126,7 @@ helios.legends({
   legendClickAction: 'highlight', // default; use 'select' for selection clicks
   scale: 1.1, // scales legend geometry
   continuousHeight: 160, // taller continuous colorbars
-  zoomAwareSizeIn2D: true, // node size legends track 2D orthographic zoom by default
+  zoomAwareSizeIn2D: true, // optional: make node size legends track 2D orthographic zoom
   titles: {
     nodeColor: null, // remove a title
     density: 'Density difference', // or override one
@@ -135,15 +184,22 @@ await helios.exportFigure('figure.png', {
 // - supersampling defaults to "auto": DPR < 2 gets a 2x backing-store boost,
 //   retina-class screens stay at native DPR unless you force it on.
 // - antialias defaults to WebGL on / WebGPU off unless you opt in.
-// - edgeAdaptiveQuality is enabled by default and averages recent active-frame
-//   times while the camera/layout is moving; if that average gets too high it
-//   temporarily uses cheap line edges, then returns to high quality once static.
+// - WebGL/WebGPU initialization defaults to powerPreference: "high-performance";
+//   pass backend-specific option objects when an embed needs stricter control.
+// - edgeAdaptiveQuality is disabled by default. When explicitly enabled, it
+//   averages recent active-frame times while the camera/layout is moving; if
+//   that average gets too high it temporarily uses cheap line edges, then
+//   returns to high quality once static.
 const crispHelios = new Helios(network, {
   container: '#app',
   antialias: true,     // WebGL context AA, or 4x MSAA on the WebGPU canvas pass
+  powerPreference: 'high-performance',
+  webglContextAttributes: { preserveDrawingBuffer: false },
+  webgpuAdapterOptions: { powerPreference: 'high-performance' },
+  webgpuCanvasConfiguration: { alphaMode: 'premultiplied' },
   supersampling: 'auto', // false | true | number | 'auto'
   edgeAdaptiveQuality: {
-    enabled: true,
+    enabled: false,
     slowFrameThresholdMs: 66,
     averageWindowFrames: 12,
     probeIntervalMs: 900,
@@ -152,10 +208,32 @@ const crispHelios = new Helios(network, {
   // forceSupersample: true, // legacy alias for always applying the auto factor
 });
 
+// Startup loading controls:
+const startupHelios = new Helios(network, {
+  container: '#app',
+  startup: {
+    loadingOverlay: true,
+    hideCanvasUntilFirstFrame: true,
+    layoutIterations: 100,
+    layoutDurationMs: 1000,
+  },
+});
+
+// When both startup layout limits are set, the first one reached releases the
+// first visible render. Initial graphs with at least 1M nodes or 1M edges use
+// a 5000 ms default startup layout duration unless explicitly overridden.
+// The spinner is removed as the first visible frame is drawn.
+// Pass startup: false to disable the startup overlay and first-frame gate.
+
 // Camera helpers:
 helios.cameraControls({
   autoFit: true,
   animation: true,
+  largeNetworkStartupFit: true,
+  largeNetworkStartupNodeThreshold: 1_000_000,
+  largeNetworkStartupEdgeThreshold: 1_000_000,
+  largeNetworkStartupScale: 4,
+  largeNetworkStartupDurationMs: 2200,
   orbit: false,
   orbitAxis: [0, 1, 0],
   orbitAngle: 0,
@@ -164,13 +242,24 @@ helios.cameraTargetNodes([0, 1, 2]);
 helios.cameraFollowNodes([0, 1, 2], { animate: true }); // keeps the centroid centered while positions move
 helios.frameNetwork({ animate: true, resetOrientation: false });
 
+// Initial networks with at least 1M nodes or 1M edges start wider by default
+// and settle toward the normal auto-fit unless the user moves the camera.
+
+// Compact overlay controls are enabled by default:
+// auto-fit toggle, layout pause/run, zoom in, and zoom out.
+// Disable all or selected groups at construction time:
+const noQuickControls = new Helios(network, { quickControls: false });
+const customQuickControls = new Helios(network, {
+  quickControls: { autoFit: true, layout: true, zoom: false, legendOffset: 64 },
+});
+
 // Narrow delegate readback helpers:
 await helios.snapshotNodePosition(7);
 await helios.snapshotNodePositions([7, 11, 13]);
 await helios.snapshotNodeCentroid([7, 11, 13]);
 ```
 
-The same API powers the example under `docs/examples/basic/main.js`, making it
+The same API powers the main app under `docs/app/main.js`, making it
 easy to copy-paste a working setup into your own application.
 
 Interpolation is GPU shader based. Timing can run in adaptive mode (average
@@ -184,6 +273,8 @@ helios.interpolation({ durationMode: 'adaptive' }); // switch back
 
 For layout-driven positions:
 - GPU-force layout automatically uses a position delegate and keeps it attached.
+- GPU-force WebGPU layout uses chunked scheduling automatically above 500k
+  active nodes unless `layoutScheduling: 'full'` is set.
 - Non-delegate layouts automatically use network position buffers.
 - Built-in layouts now run at scheduler cadence (no `updateIntervalMs` throttling).
 
@@ -227,7 +318,7 @@ await helios.transitionCamera({
 For reusable filter presets, use `HeliosFilter` and activate whichever one you need:
 
 ```js
-import { HeliosFilter } from 'helios-web-next';
+import { HeliosFilter } from 'helios-web';
 
 const exploratory = new HeliosFilter({ scope: 'render+layout' });
 exploratory.addRule({ scope: 'node', type: 'numeric', attribute: 'weight', min: 0.4, max: 1.0, extentMin: 0, extentMax: 1 });
@@ -241,13 +332,18 @@ helios.activateHeliosFilter(exploratory);
 helios.activateHeliosFilter(strict);
 ```
 
+In the built-in UI, categorical filters use compact checklist rows with
+per-category counts plus `All` and `None` actions. This is the same rule editor
+used by the Selection panel selector rules and it stays on the normal debounced
+filter update path.
+
 Position delegation now uses an abstract `PositionDelegate` contract, so delegates
 can safely synchronize against topology/index version changes before handing
 buffers to the renderer.
 
 ## Headless Smoke Test
 
-Run `npm run test:e2e` to boot the basic example in a headless Chromium session
+Run `npm run test:e2e` to boot the main app in a headless Chromium session
 via Playwright. The test forces the WebGL renderer, waits for Helios to finish
 bootstrapping, and samples pixels from the canvas to ensure the output isn't
 stuck at the background color. This provides a quick automated sanity check that
@@ -290,7 +386,7 @@ Development docs and test commands live in `DEVELOPING.md`.
   node/edge attributes into colors or sizes; mapped values are written into
   sparse visual attributes.
 
-The demo in `docs/examples/basic/main.js` showcases how to instantiate a
+The main app in `docs/app/main.js` showcases how to instantiate a
 network, define visual attributes, and kick off Helios with a worker-driven
 layout.
 

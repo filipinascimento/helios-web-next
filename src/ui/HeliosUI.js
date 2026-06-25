@@ -14,6 +14,12 @@ import { createSelectControl } from './controls/createSelectControl.js';
 import { createLightDirectionControl } from './controls/LightDirectionControl.js';
 import { PanelStack } from './panels/PanelStack.js';
 import { TabbedPanel } from './panels/TabbedPanel.js';
+import {
+  FILTERS_PANEL_SCHEMA,
+  SCENE_PANEL_SCHEMA,
+  createPanelSchemaIndicator,
+  humanizeControlLabel,
+} from './panels/panelSchema.js';
 import { colormaps } from '../colors/colormaps.js';
 import { VISUAL_ATTRIBUTE_MAP } from '../pipeline/constants.js';
 import { MappersPanel } from './panels/MappersPanel.js';
@@ -39,9 +45,25 @@ import {
 
 const INTERFACE_CONTROL_RELEASE_MS = 420;
 const FULLSCREEN_OVERLAY_LEFT_INSET_PX = 28;
+const LOGGED_SYNC_FAILURE_KEYS = new Set();
+const MAX_LOGGED_SYNC_FAILURE_KEYS = 100;
 
-const PERSISTENCE_ACCESSOR_PATHS = Object.freeze({
+function storageCapabilities(helios) {
+  return helios?.storage?.capabilities ?? {};
+}
+
+function storageSupportsPersistentUI(helios) {
+  const capabilities = storageCapabilities(helios);
+  return capabilities.persistent === true || capabilities.sessions === true;
+}
+
+function storageSupportsSessions(helios) {
+  return storageCapabilities(helios).sessions === true;
+}
+
+const STATE_ACCESSOR_PATHS = Object.freeze({
   background: 'appearance.background',
+  clearColor: 'appearance.background',
   edgeTransparencyMode: 'appearance.edgeTransparencyMode',
   supersampling: 'appearance.supersampling',
   nodeSizeScale: 'appearance.nodeStyle.sizeScale',
@@ -92,9 +114,74 @@ const PERSISTENCE_ACCESSOR_PATHS = Object.freeze({
   ambientOcclusionIntensityScale: 'appearance.ambientOcclusion.intensityScale',
   ambientOcclusionIntensityShift: 'appearance.ambientOcclusion.intensityShift',
   ambientOcclusionQuality: 'appearance.ambientOcclusion.quality',
+  labelsMode: 'labels.mode',
+  labelsSelectedOnlySpaceAware: 'labels.selectedOnlySpaceAware',
+  labelsEnabled: 'labels.enabled',
+  labelsMaxVisible: 'labels.maxVisible',
+  labelsFontSizeScale: 'labels.fontSizeScale',
+  labelsMinScreenRadius: 'labels.minScreenRadius',
+  labelsOutlineWidth: 'labels.outlineWidth',
+  labelsOffsetRadiusFactor: 'labels.offsetRadiusFactor',
+  labelsOffsetPx: 'labels.offsetPx',
+  labelsMaxChars: 'labels.maxChars',
+  labelsMaxRows: 'labels.maxRows',
+  legendsEnabled: 'legends.enabled',
 });
 
-function scopeForPersistencePath(path) {
+const STATE_ACCESSOR_DEBOUNCE_MS = 180;
+const BASELINE_REFRESH_IGNORED_OVERRIDES = new Set(['exporter.baseName', 'exporter.preset']);
+
+function stateScopeForPath(path) {
+  const root = String(path ?? '').split('.')[0];
+  if (root === 'ui' || root === 'interface') return 'user';
+  if (root === 'network' || root === 'positions') return 'workspace';
+  return 'network';
+}
+
+function persistencePanelPathForId(id, title = '') {
+  const normalizedId = String(id ?? '').trim();
+  const normalizedTitle = String(title ?? '').trim().toLowerCase();
+  if (normalizedId === 'helios-ui-mappers' || normalizedTitle === 'mappers') return 'mappers';
+  if (normalizedId === 'helios-ui-filter' || normalizedTitle === 'filter' || normalizedTitle === 'filters') return 'filters';
+  if (normalizedId === 'helios-ui-layout' || normalizedTitle === 'layout') return 'layout';
+  if (normalizedId === 'helios-ui-legends' || normalizedTitle === 'legends') return 'legends';
+  if (normalizedId === 'helios-ui-camera' || normalizedTitle === 'camera') return 'camera';
+  if (normalizedId === 'helios-ui-selection' || normalizedTitle === 'selection') return 'selection';
+  if (normalizedId === 'helios-ui-metrics' || normalizedTitle === 'metrics') return 'metrics';
+  return null;
+}
+
+function stateDebounceForPath(path) {
+  const text = String(path ?? '');
+  if (text.startsWith('camera.')) return 500;
+  if (text.startsWith('layout.')) return 220;
+  if (text.startsWith('mappers.') || text.startsWith('filters.')) return 300;
+  return STATE_ACCESSOR_DEBOUNCE_MS;
+}
+
+function clonePersistenceValue(value) {
+  if (value == null || typeof value !== 'object') return value;
+  try {
+    if (typeof structuredClone === 'function') return structuredClone(value);
+  } catch (_) {
+    // Fall back to JSON cloning below.
+  }
+  try {
+    return JSON.parse(JSON.stringify(value));
+  } catch (_) {
+    return value;
+  }
+}
+
+function stateValueSignature(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function scopeForStatePath(path) {
   const parts = String(path ?? '').split('.').filter(Boolean);
   if (parts.length >= 2) return `${parts[0]}.${parts[1]}`;
   return parts[0] ?? '';
@@ -238,19 +325,28 @@ function createInterfaceIcon(doc, kind) {
  * @apiSection User Interface
  * @param {object} [options] - UI construction options.
  * @param {Helios} [options.helios] - Helios instance to inspect and control.
- * @param {HTMLElement} [options.container] - Existing UI container.
+ * @param {HTMLElement} [options.container] - Existing UI container. When omitted the UI creates or reuses a layer on the Helios root.
+ * @param {string} [options.layerName='ui'] - Layer name used when the UI attaches to the Helios layer manager.
  * @param {'dark'|'light'} [options.theme] - Initial UI theme.
+ * @param {'default'|string} [options.styles='default'] - Built-in style preset or external style mode.
+ * @param {Document} [options.document] - Document used for custom elements and style installation.
+ * @param {boolean} [options.allowDrag=true] - Enable dragging floating panels.
+ * @param {number|string} [options.labelColumn] - Optional fixed label-column sizing for generated controls.
+ * @param {boolean} [options.persistenceIndicators] - Show dirty/default markers when persistent storage supports them.
+ * @param {object} [options.interface] - Interface behavior options passed to `helios.useBehavior('interface', ...)`.
+ * @param {object} [options.behaviors] - Behavior option bag used by built-in UI behaviors.
  * @example
  * const ui = new HeliosUI({ helios, theme: 'dark' });
  */
 export class HeliosUI {
   constructor(options = {}) {
     this.helios = options.helios ?? null;
+    if (this.helios && !this.helios.ui) this.helios.ui = this;
     this.helios?.behaviors?.setUI?.(this);
     this.layerName = options.layerName ?? 'ui';
     this.theme = options.theme ?? 'dark';
     this.styles = options.styles ?? 'default';
-    this.persistenceIndicators = options.persistenceIndicators !== false;
+    this.persistenceIndicators = options.persistenceIndicators !== false && storageSupportsPersistentUI(this.helios);
 
     if (this.styles === 'default') ensureDefaultStyles(options.document ?? document);
 
@@ -263,6 +359,7 @@ export class HeliosUI {
       layerName: this.layerName,
     });
     this.container.classList.add('helios-ui');
+    this.container.classList.toggle('helios-ui--storage-disabled', !this.persistenceIndicators);
     this.container.dataset.theme = this.theme;
     this._controlCleanups = new Set();
     this._boundAttributesById = new Map();
@@ -274,6 +371,9 @@ export class HeliosUI {
     this._pendingPanelHeaderShine = null;
     this._persistenceIndicatorObserver = null;
     this._persistenceIndicatorFrame = null;
+    this._persistenceBaselineRefreshTimer = null;
+    this._stateAccessorBindings = new WeakSet();
+    this._lastLoggedSyncFailure = null;
 
     this.panelManager = new PanelManager({
       container: this.container,
@@ -284,9 +384,35 @@ export class HeliosUI {
     this._interfaceResizeObserver = null;
     this._interfaceChrome = this._createInterfaceChrome();
     this.interfaceBehavior?.bindUI?.(this);
+    this._registerStateKey('ui.theme', {
+      scope: 'user',
+      debounceMs: 0,
+      defaultValue: this.theme,
+      metadata: { control: 'theme' },
+    });
     this._installInterfaceViewportTracking();
     this._installInterfaceControlTracking();
     this._installPersistenceIndicatorFallback();
+    const pendingUiState = this.helios?._pendingVisualizationUiState;
+    if (pendingUiState && typeof pendingUiState === 'object') {
+      const applyPendingUiState = () => {
+        this.restoreState(pendingUiState);
+        this.helios._pendingVisualizationUiState = null;
+        this._writeStateValue('ui.theme', this.theme, {
+          scope: 'user',
+          source: 'restore',
+          reason: 'theme-restore',
+          debounceMs: 0,
+          autosave: false,
+          trackOverride: false,
+        });
+      };
+      applyPendingUiState();
+      if (this.helios?._pendingPersistenceBaselineRefresh === true) {
+        this.helios._pendingPersistenceBaselineRefresh = false;
+      }
+      this.helios._pendingVisualizationUiState = null;
+    }
     this._syncInterfaceState();
     const dockMetricsUnsubscribe = this.panelManager.onDockMetricsChange?.((insets) => {
       this._latestDockInsets = { ...insets };
@@ -315,15 +441,195 @@ export class HeliosUI {
     if (this._heliosBindingUnsubscribe) this._controlCleanups.add(this._heliosBindingUnsubscribe);
   }
 
+  _schedulePersistenceBaselineRefresh() {
+    const storage = this.helios?.storage ?? null;
+    const stateManager = this.helios?.states ?? null;
+    if (!storage || typeof storage.flush !== 'function') return;
+    const hasBlockingOverride = (overrides = {}) => Object.keys(overrides)
+      .some((path) => !BASELINE_REFRESH_IGNORED_OVERRIDES.has(path));
+    if (hasBlockingOverride(stateManager?.getOverrides?.({ aliases: false }) ?? {})) return;
+    if (this._persistenceBaselineRefreshTimer != null) clearTimeout(this._persistenceBaselineRefreshTimer);
+    this._persistenceBaselineRefreshTimer = setTimeout(() => {
+      this._persistenceBaselineRefreshTimer = null;
+      const latestStorage = this.helios?.storage ?? null;
+      const latestStates = this.helios?.states ?? null;
+      if (!latestStorage || hasBlockingOverride(latestStates?.getOverrides?.({ aliases: false }) ?? {})) return;
+      if (this.helios) this.helios._pendingPersistenceBaselineRefresh = false;
+    }, 0);
+  }
+
+  /**
+   * Register a UI-owned value with the Helios state manager.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {string} path - Persistent state path.
+   * @param {object} [options] - State metadata and UI-control hints.
+   * @returns {Function|null} Cleanup function returned by the state manager, or `null` when state tracking is unavailable.
+   */
+  registerStateControl(path, options = {}) {
+    const stateManager = this.helios?.states ?? null;
+    if (!path || typeof stateManager?.register !== 'function') return null;
+    const existingEntry = typeof stateManager?.entry === 'function' ? stateManager.entry(path) : null;
+    const targetPath = existingEntry?.key ?? path;
+    const hasDefaultValue = Object.prototype.hasOwnProperty.call(options, 'defaultValue');
+    const hasOverride = stateManager?.status?.(targetPath)?.hasOverride === true;
+    const defaultValue = hasDefaultValue ? options.defaultValue : existingEntry?.default ?? null;
+    try {
+      return stateManager.register(this, '', {
+        [targetPath]: {
+          ...(existingEntry ?? {}),
+          default: clonePersistenceValue(hasOverride ? stateManager.get(targetPath) : defaultValue),
+          scope: options.scope ?? stateScopeForPath(path),
+          type: options.type ?? existingEntry?.type ?? 'object',
+          ui: {
+            ...(existingEntry?.ui ?? {}),
+            label: options.label ?? existingEntry?.ui?.label,
+            controller: options.controller ?? existingEntry?.ui?.controller,
+            debounceMs: options.debounceMs ?? stateDebounceForPath(path),
+          },
+        },
+      });
+    } catch (error) {
+      console.warn(`[HeliosUI] Failed to register state control "${path}".`, error);
+      return null;
+    }
+  }
+
+  _registerStateKey(path, options = {}) {
+    return this.registerStateControl(path, options);
+  }
+
+  /**
+   * Write a UI control value through the Helios state manager.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {string} path - Persistent state path.
+   * @param {*} value - Value to store.
+   * @param {object} [options] - Persistence, debounce, source, and override-tracking options.
+   * @returns {*|null} State-manager write result, or `null` when state tracking is unavailable.
+   */
+  writeStateControl(path, value, options = {}) {
+    const stateStore = this.helios?.states ?? null;
+    if (!path || typeof stateStore?.set !== 'function') return null;
+    try {
+      const writeOptions = {
+        scope: options.scope ?? stateScopeForPath(path),
+        source: options.source ?? 'ui',
+        reason: options.reason ?? 'control',
+        autosave: options.autosave,
+        applyBinding: options.applyBinding,
+        debounceMs: options.debounceMs,
+        journal: options.journal ?? false,
+      };
+      const trackOverride = options.trackOverride ?? this.helios?.storage?.overrideTrackingReady !== false;
+      if (trackOverride === false || Object.prototype.hasOwnProperty.call(options, 'trackOverride')) {
+        writeOptions.trackOverride = trackOverride;
+      }
+      return stateStore.set(path, value, writeOptions);
+    } catch (error) {
+      console.warn(`[HeliosUI] Failed to write state control "${path}".`, error);
+      return null;
+    }
+  }
+
+  _writeStateValue(path, value, options = {}) {
+    return this.writeStateControl(path, value, options);
+  }
+
+  /**
+   * Create a dirty/default indicator for a state path or state scope.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {string} [path=''] - State path to observe.
+   * @param {string|null} [scope=null] - Indicator scope override.
+   * @param {object} [options] - Registration and tooltip options.
+   * @returns {HTMLElement|null} Indicator element, or `null` when indicators are disabled.
+   */
+  createStateIndicator(path = '', scope = null, options = {}) {
+    if (!this.persistenceIndicators) return null;
+    const target = String(path ?? '').trim();
+    if (target && options.register !== false) {
+      this.registerStateControl(target, {
+        scope: options.persistenceScope ?? stateScopeForPath(target),
+        debounceMs: options.debounceMs ?? stateDebounceForPath(target),
+        ...(Object.prototype.hasOwnProperty.call(options, 'defaultValue')
+          ? { defaultValue: options.defaultValue }
+          : {}),
+        metadata: options.metadata,
+      });
+    }
+    return createDirtyIndicator({
+      helios: this.helios,
+      path: target,
+      scope: scope ?? options.indicatorScope ?? target,
+      mode: options.mode,
+      attachTooltip: options.attachTooltip,
+    });
+  }
+
+  _trackAttributeState(attribute, path, options = {}) {
+    if (!attribute || !path || this._stateAccessorBindings.has(attribute)) return;
+    this._stateAccessorBindings.add(attribute);
+    const debounceMs = options.debounceMs ?? stateDebounceForPath(path);
+    const scope = options.scope ?? stateScopeForPath(path);
+    const initialValue = typeof attribute.value === 'function' ? attribute.value() : options.defaultValue;
+    this._registerStateKey(path, {
+      scope,
+      debounceMs,
+      defaultValue: options.defaultValue ?? initialValue,
+      metadata: { binding: attribute.id ?? null, ...(options.metadata ?? {}) },
+    });
+    let previousSignature = stateValueSignature(initialValue);
+    const unsubscribe = attribute.subscribe((value) => {
+      const nextSignature = stateValueSignature(value);
+      if (nextSignature === previousSignature) return;
+      previousSignature = nextSignature;
+      this._writeStateValue(path, value, {
+        scope,
+        source: 'ui',
+        reason: options.reason ?? 'control',
+        debounceMs,
+        applyBinding: false,
+      });
+    }, { immediate: false });
+    this._controlCleanups.add(() => unsubscribe());
+  }
+
+  /**
+   * Apply a UI theme.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {'dark'|'light'|string} theme - Theme name stored on the UI container.
+   * @returns {void}
+   */
   setTheme(theme) {
     this.theme = theme;
     if (this.container) this.container.dataset.theme = theme;
+    this.helios?._syncQuickControlsTheme?.(theme);
   }
 
+  /**
+   * Toggle between the built-in dark and light themes.
+   *
+   * @public
+   * @apiSection User Interface
+   * @returns {void}
+   */
   toggleTheme() {
     this.setTheme(this.theme === 'dark' ? 'light' : 'dark');
   }
 
+  /**
+   * Serialize UI panel, dock, theme, and responsive-interface state.
+   *
+   * @public
+   * @apiSection User Interface
+   * @returns {object} Serializable UI state snapshot.
+   */
   serializeState() {
     const panelState = this.panelManager?.serializeState?.() ?? {};
     const interfaceState = this.interfaceBehavior?.serializeInterfaceState?.() ?? {};
@@ -335,6 +641,14 @@ export class HeliosUI {
     };
   }
 
+  /**
+   * Restore a UI state snapshot.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [state={}] - Snapshot returned by `serializeState()`.
+   * @returns {HeliosUI} This UI instance.
+   */
   restoreState(state = {}) {
     if (!state || typeof state !== 'object') return this;
     if (typeof state.theme === 'string' && state.theme) {
@@ -346,6 +660,13 @@ export class HeliosUI {
     return this;
   }
 
+  /**
+   * Resolve the best available viewport width for responsive UI behavior.
+   *
+   * @public
+   * @apiSection User Interface
+   * @returns {number} Width in CSS pixels, or zero when unavailable.
+   */
   getViewportWidth() {
     const candidates = [
       this.container?.clientWidth,
@@ -362,6 +683,14 @@ export class HeliosUI {
     return 0;
   }
 
+  /**
+   * Apply responsive interface state to the UI container and panel manager.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [state={}] - Interface behavior snapshot.
+   * @returns {HeliosUI} This UI instance.
+   */
   applyInterfaceBehaviorState(state = {}) {
     const snapshot = state && typeof state === 'object' ? state : {};
     this.container.dataset.interfaceMode = snapshot.mode ?? 'desktop';
@@ -389,14 +718,17 @@ export class HeliosUI {
     if (mode === 'compact') {
       this.helios?.layers?.setViewportInsets?.(this._latestDockInsets);
       this.helios?.overlayInsets?.({ top: 0, right: 0, bottom: 0, left: 0 });
+      this.helios?._updateQuickControlsPlacement?.();
       return;
     }
     this.helios?.layers?.setViewportInsets?.({ top: 0, right: 0, bottom: 0, left: 0 });
     if (mode === 'fullscreen') {
       this.helios?.overlayInsets?.({ top: 0, right: 0, bottom: 0, left: FULLSCREEN_OVERLAY_LEFT_INSET_PX });
+      this.helios?._updateQuickControlsPlacement?.();
       return;
     }
     this.helios?.overlayInsets?.(this._latestDockInsets);
+    this.helios?._updateQuickControlsPlacement?.();
   }
 
   _installInterfaceViewportTracking() {
@@ -416,7 +748,7 @@ export class HeliosUI {
   }
 
   _syncInterfaceState() {
-    this.applyInterfaceBehaviorState(this.interfaceBehavior?.serializeInterfaceState?.() ?? {
+    this.applyInterfaceBehaviorState(this.interfaceBehavior?.serializeInterfaceState?.({ includeResumePrompt: true }) ?? {
       dockSide: 'left',
       mode: 'desktop',
       interfaceVisible: true,
@@ -470,6 +802,13 @@ export class HeliosUI {
       for (const panel of this.container.querySelectorAll('.helios-ui-panel')) {
         const titleWrap = panel.querySelector(':scope > .helios-ui-panel__header .helios-ui-panel__title-wrap');
         if (!titleWrap) continue;
+        if (
+          panel.querySelector(':scope > .helios-ui-panel__header .helios-ui-panel__persistence-indicator')
+          || panel.querySelector(':scope > .helios-ui-panel__header .helios-ui-dirty-indicator--schema')
+        ) {
+          titleWrap.querySelector(':scope > .helios-ui-dirty-indicator--group')?.remove();
+          continue;
+        }
         let indicator = titleWrap.querySelector(':scope > .helios-ui-dirty-indicator--group');
         if (!indicator) {
           indicator = createGroupIndicator();
@@ -480,6 +819,14 @@ export class HeliosUI {
       for (const subpanel of this.container.querySelectorAll('.helios-ui-subpanel')) {
         const header = subpanel.querySelector(':scope > .helios-ui-subpanel__header-row > .helios-ui-subpanel__header');
         if (!header) continue;
+        const headerRow = subpanel.querySelector(':scope > .helios-ui-subpanel__header-row');
+        if (
+          headerRow?.querySelector?.(':scope > .helios-ui-subpanel__header-controls .helios-ui-dirty-indicator')
+          || header.querySelector(':scope > .helios-ui-dirty-indicator--schema')
+        ) {
+          header.querySelector(':scope > .helios-ui-dirty-indicator--group')?.remove();
+          continue;
+        }
         let indicator = header.querySelector(':scope > .helios-ui-dirty-indicator--group');
         if (!indicator) {
           indicator = createGroupIndicator();
@@ -504,12 +851,10 @@ export class HeliosUI {
       });
       this._controlCleanups.add(() => this._persistenceIndicatorObserver?.disconnect?.());
     }
-    const sessionController = this.helios?.persistence?.sessionController ?? null;
-    sessionController?.addEventListener?.('change', schedule);
-    sessionController?.addEventListener?.('config', schedule);
+    const storage = this.helios?.storage ?? null;
+    storage?.addEventListener?.('change', schedule);
     this._controlCleanups.add(() => {
-      sessionController?.removeEventListener?.('change', schedule);
-      sessionController?.removeEventListener?.('config', schedule);
+      storage?.removeEventListener?.('change', schedule);
     });
     this._controlCleanups.add(() => {
       if (this._persistenceIndicatorFrame == null) return;
@@ -569,22 +914,71 @@ export class HeliosUI {
     resumeButton.type = 'button';
     resumeButton.className = 'helios-ui-button';
     resumeButton.textContent = 'Resume';
-    resumeButton.addEventListener('click', () => {
+    resumeButton.addEventListener('click', async () => {
+      const prompt = this.interfaceBehavior?.resumePrompt?.() ?? null;
+      let sessions = Array.isArray(prompt?.sessions) ? prompt.sessions.filter((entry) => entry?.id) : [];
+      const storage = this.helios?.storage ?? null;
+      const resumeSource = storage;
+      if (sessions.length <= 1 && typeof resumeSource?.getResumeSessions === 'function') {
+        sessions = await resumeSource.getResumeSessions({ limit: 8 });
+      }
+      if (sessions.length > 1) {
+        renderResumeMenu(sessions);
+        resumeMenu.hidden = false;
+        return;
+      }
       this.interfaceBehavior?.resumeSession?.();
     });
+
+    const resumeMenu = doc.createElement('div');
+    resumeMenu.className = 'helios-ui-resume-prompt__menu';
+    resumeMenu.hidden = true;
+
+    const renderResumeMenu = (sessions = []) => {
+      resumeMenu.replaceChildren();
+      for (let i = 0; i < sessions.length; i += 1) {
+        const session = sessions[i];
+        const item = doc.createElement('button');
+        item.type = 'button';
+        item.className = 'helios-ui-resume-prompt__menu-item';
+        item.dataset.sessionId = session.id;
+        item.textContent = this._formatResumeSessionLabel(session, i);
+        item.addEventListener('click', async () => {
+          resumeMenu.hidden = true;
+          resumePrompt.hidden = true;
+          item.disabled = true;
+          try {
+            await (this.interfaceBehavior?.resumeSession?.({ sessionId: session.id })
+              ?? this.helios?.storage?.resumeSession?.(session.id));
+          } finally {
+            item.disabled = false;
+          }
+        });
+        resumeMenu.appendChild(item);
+      }
+    };
+    resumeMenu.__heliosRenderSessions = renderResumeMenu;
 
     const freshButton = doc.createElement('button');
     freshButton.type = 'button';
     freshButton.className = 'helios-ui-button';
     freshButton.textContent = 'Start Fresh';
-    freshButton.addEventListener('click', () => {
-      this.interfaceBehavior?.startFresh?.();
+    freshButton.addEventListener('click', async () => {
+      resumeMenu.hidden = true;
+      resumePrompt.hidden = true;
+      freshButton.disabled = true;
+      try {
+        await this.interfaceBehavior?.startFresh?.();
+      } finally {
+        freshButton.disabled = false;
+      }
     });
 
     resumeActions.appendChild(resumeButton);
     resumeActions.appendChild(freshButton);
     resumePrompt.appendChild(resumeText);
     resumePrompt.appendChild(resumeActions);
+    resumePrompt.appendChild(resumeMenu);
 
     surface.appendChild(compactDockToggle);
     surface.appendChild(fullscreenBar);
@@ -599,7 +993,23 @@ export class HeliosUI {
       fullscreenPanelNav,
       resumePrompt,
       resumeText,
+      resumeMenu,
     };
+  }
+
+  _formatResumeSessionLabel(session, index = 0) {
+    const timestamp = Number(session?.updatedAt);
+    const date = Number.isFinite(timestamp) && timestamp > 0
+      ? new Date(timestamp).toLocaleString(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      })
+      : 'unknown date';
+    if (index === 0) return `Latest - ${date}`;
+    const label = String(session?.label ?? session?.id ?? `Session ${index + 1}`).trim() || `Session ${index + 1}`;
+    return `${label} - ${date}`;
   }
 
   _renderInterfaceChrome(state = {}) {
@@ -636,11 +1046,23 @@ export class HeliosUI {
     );
     this._renderFullscreenPanelNav(snapshot);
 
-    const prompt = snapshot.resumePrompt ?? null;
+    const prompt = storageSupportsSessions(this.helios) && !this.helios?.storage?.requestedSessionId
+      ? (snapshot.resumePrompt ?? null)
+      : null;
     chrome.resumePrompt.hidden = !prompt?.visible;
     if (prompt?.visible) {
       const sourceName = prompt.networkSource?.name ?? prompt.networkSource?.baseName ?? 'previous session';
-      chrome.resumeText.textContent = `Resume unfinished session from ${sourceName}?`;
+      const sessions = Array.isArray(prompt.sessions) ? prompt.sessions.filter((entry) => entry?.id) : [];
+      chrome.resumeText.textContent = sessions.length > 1
+        ? `Resume a previous session?`
+        : `Resume previous session from ${sourceName}?`;
+      if (chrome.resumeMenu) {
+        chrome.resumeMenu.hidden = true;
+        chrome.resumeMenu.__heliosRenderSessions?.(sessions);
+      }
+    } else if (chrome.resumeMenu) {
+      chrome.resumeMenu.hidden = true;
+      chrome.resumeMenu.replaceChildren();
     }
   }
 
@@ -899,6 +1321,15 @@ export class HeliosUI {
     }, INTERFACE_CONTROL_RELEASE_MS);
   }
 
+  /**
+   * Bind a Helios accessor method to a UIAttribute.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {string} accessorName - Name of the Helios getter/setter method.
+   * @param {object} [options] - Attribute metadata, range, persistence, and labeling options.
+   * @returns {UIAttribute} Attribute wrapper suitable for controls and panels.
+   */
   bindHeliosAccessor(accessorName, options = {}) {
     if (!this.helios) {
       throw new Error('HeliosUI.bindHeliosAccessor requires a Helios instance');
@@ -912,8 +1343,16 @@ export class HeliosUI {
       : null;
     const merged = info ? { ...info, ...options } : options;
     const eventName = merged.eventName ?? (accessorName === 'background' ? 'clearColor' : accessorName);
+    const persistencePath = STATE_ACCESSOR_PATHS[accessorName] ?? STATE_ACCESSOR_PATHS[eventName] ?? null;
+    const storageAttribute = this._createStateBackedAttribute(persistencePath, {
+      ...merged,
+      id: merged.id ?? `helios.${eventName}`,
+      label: merged.label ?? humanizeControlLabel(accessorName),
+      meta: { source: 'helios', accessor: accessorName, eventName, ...merged.meta },
+    });
+    if (storageAttribute) return storageAttribute;
     const id = merged.id ?? `helios.${eventName}`;
-    const label = merged.label ?? accessorName;
+    const label = merged.label ?? humanizeControlLabel(accessorName);
     const defaultValue = merged.defaultValue ?? null;
     const type = merged.type ?? 'number';
     const makeAttribute = (factory) => factory({
@@ -938,10 +1377,28 @@ export class HeliosUI {
         ? makeAttribute(UIAttribute.string)
         : makeAttribute(UIAttribute.number);
     this._boundAttributesById.set(id, attribute);
+    if (persistencePath) {
+      this._trackAttributeState(attribute, persistencePath, {
+        scope: merged.persistenceScope ?? stateScopeForPath(persistencePath),
+        debounceMs: merged.persistenceDebounceMs ?? stateDebounceForPath(persistencePath),
+        defaultValue,
+        metadata: { accessor: accessorName, eventName },
+      });
+    }
     this._ensureHeliosBindingListener();
     return attribute;
   }
 
+  /**
+   * Bind a behavior accessor method to a UIAttribute.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {Behavior} behavior - Behavior instance that owns the accessor.
+   * @param {string} accessorName - Name of the behavior getter/setter method.
+   * @param {object} [options] - Attribute metadata, range, persistence, and labeling options.
+   * @returns {UIAttribute} Attribute wrapper suitable for controls and panels.
+   */
   bindBehaviorAccessor(behavior, accessorName, options = {}) {
     if (!behavior || typeof behavior?.[accessorName] !== 'function') {
       throw new Error(`Behavior has no accessor method "${accessorName}()"`);
@@ -951,7 +1408,17 @@ export class HeliosUI {
       : null;
     const merged = info ? { ...info, ...options } : options;
     const id = merged.id ?? `helios.behavior.${behavior.id ?? 'behavior'}.${accessorName}`;
-    const label = merged.label ?? accessorName;
+    const label = merged.label ?? humanizeControlLabel(accessorName);
+    const behaviorId = String(behavior.id ?? 'behavior');
+    const mappedPersistencePath = STATE_ACCESSOR_PATHS[accessorName] ?? null;
+    const persistencePath = merged.persistencePath ?? mappedPersistencePath ?? `behaviors.${behaviorId}.${accessorName}`;
+    const storageAttribute = this._createStateBackedAttribute(persistencePath, {
+      ...merged,
+      id,
+      label,
+      meta: { source: 'behavior', behavior: behavior.id ?? null, accessor: accessorName, ...merged.meta },
+    });
+    if (storageAttribute) return storageAttribute;
     const defaultValue = merged.defaultValue ?? null;
     const type = merged.type ?? 'number';
     const makeAttribute = (factory) => factory({
@@ -975,18 +1442,123 @@ export class HeliosUI {
       : type === 'string'
         ? makeAttribute(UIAttribute.string)
         : makeAttribute(UIAttribute.number);
+    this._trackAttributeState(attribute, persistencePath, {
+      scope: merged.persistenceScope ?? (behaviorId === 'interface' || behaviorId === 'exporter' ? 'user' : 'network'),
+      debounceMs: merged.persistenceDebounceMs ?? STATE_ACCESSOR_DEBOUNCE_MS,
+      defaultValue,
+      metadata: { behavior: behaviorId, accessor: accessorName },
+    });
     const unsubscribe = behavior.on?.('change', () => attribute.notify()) ?? (() => {});
     this._controlCleanups.add(() => unsubscribe());
     return attribute;
   }
 
+  _createStateBackedAttribute(path, options = {}) {
+    const stateManager = this.helios?.states ?? null;
+    const target = String(path ?? '').trim();
+    if (!target || typeof stateManager?.entry !== 'function' || typeof stateManager?.set !== 'function') return null;
+    const entry = stateManager.entry(target);
+    if (!entry) return null;
+    const ui = entry.ui ?? {};
+    const type = entry.type === 'boolean'
+      ? 'boolean'
+      : (entry.type === 'string' || entry.type === 'enum' ? 'string' : 'number');
+    const defaultValue = Object.prototype.hasOwnProperty.call(options, 'defaultValue')
+      ? options.defaultValue
+      : entry.default;
+    const meta = {
+      storageKey: target,
+      ...(options.meta ?? {}),
+    };
+    if (ui.inputMin != null) meta.inputMin = ui.inputMin;
+    if (ui.inputMax != null) meta.inputMax = ui.inputMax;
+    const attributeOptions = {
+      id: options.id ?? entry.key ?? target,
+      label: ui.label ?? options.label ?? humanizeControlLabel(entry.key ?? target),
+      readOnly: Boolean(options.readOnly ?? false),
+      min: options.min ?? ui.min ?? ui.sliderMin ?? null,
+      max: options.max ?? ui.max ?? ui.sliderMax ?? null,
+      step: options.step ?? ui.step ?? null,
+      domain: options.domain ?? null,
+      recommendedRange: options.recommendedRange ?? (
+        Number.isFinite(Number(ui.sliderMin)) && Number.isFinite(Number(ui.sliderMax))
+          ? { min: Number(ui.sliderMin), max: Number(ui.sliderMax) }
+          : null
+      ),
+      meta,
+      get: () => {
+        const value = stateManager.get(target, defaultValue);
+        return value == null ? defaultValue : value;
+      },
+      set: (value) => {
+        stateManager.set(target, value, {
+          source: 'ui',
+          reason: options.reason ?? 'control',
+          autosave: options.autosave,
+          debounceMs: type === 'boolean' ? 0 : options.persistenceDebounceMs,
+          journal: false,
+        });
+      },
+    };
+    const attribute = type === 'boolean'
+      ? UIAttribute.boolean(attributeOptions)
+      : type === 'string'
+        ? UIAttribute.string(attributeOptions)
+        : UIAttribute.number(attributeOptions);
+    this._boundAttributesById.set(attribute.id, attribute);
+    const unsubscribe = stateManager.subscribe(target, (_value, detail = {}) => {
+      if (detail?.source === 'ui') return;
+      attribute.notify();
+    }, { immediate: false });
+    this._controlCleanups.add(() => unsubscribe());
+    return attribute;
+  }
+
+  /**
+   * Create a standard Helios UI panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} options - Panel id, title, placement, content, schema, and persistence options.
+   * @returns {Panel} Panel instance returned by the panel manager.
+   */
   createPanel(options) {
-    return this.panelManager.createPanel({
+    const panel = this.panelManager.createPanel({
       ...options,
       icon: options?.icon ?? resolvePanelIconKind({ id: options?.id, title: options?.title }),
     });
+    const panelSchema = options?.panelSchema ?? null;
+    const persistencePath = options?.persistencePath === false
+      ? null
+      : (panelSchema ? null : (options?.persistencePath ?? persistencePanelPathForId(options?.id, options?.title)));
+    if ((panelSchema || persistencePath) && panel?.actionsEl) {
+      const indicator = panelSchema
+        ? createPanelSchemaIndicator({
+          helios: this.helios,
+          schema: panelSchema,
+        })
+        : this.createStateIndicator(persistencePath, persistencePath, {
+          mode: 'scope',
+          metadata: { panel: options?.id ?? null },
+        });
+      if (indicator) {
+        indicator.classList.add('helios-ui-panel__persistence-indicator');
+        panel.actionsEl.insertBefore(indicator, panel.collapseButton ?? null);
+        this._controlCleanups.add(() => indicator.destroy?.());
+      }
+    }
+    this._schedulePersistenceBaselineRefresh();
+    return panel;
   }
 
+  /**
+   * Create a panel whose content is managed by a tabbed panel primitive.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel and tab options.
+   * @returns {Panel} Created panel instance.
+   */
   createTabbedPanel(options = {}) {
     const tabs = new TabbedPanel({
       tabs: options.tabs ?? [],
@@ -1001,22 +1573,32 @@ export class HeliosUI {
       title: options.title,
       position: options.position,
       dock: options.dock,
+      persistencePath: options.persistencePath,
+      panelSchema: options.panelSchema,
       content: tabs.element,
     });
   }
 
+  /**
+   * Create the default scene/demo controls panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and title options.
+   * @returns {Panel} Created panel instance.
+   */
   createDemoPanel(options = {}) {
     const content = document.createElement('div');
 
     const tooltips = createTooltipManager();
     this._controlCleanups.add(() => tooltips.destroy());
 
-    const createPersistenceIndicator = (path = '', scope = null) => {
+    const createStateIndicator = (path = '', scope = null) => {
       if (!this.persistenceIndicators) return null;
       const indicator = createDirtyIndicator({
         helios: this.helios,
         path: path ?? '',
-        scope: scope ?? scopeForPersistencePath(path),
+        scope: scope ?? scopeForStatePath(path),
         attachTooltip: tooltips.attachTooltip,
       });
       this._controlCleanups.add(() => indicator.destroy?.());
@@ -1027,16 +1609,16 @@ export class HeliosUI {
       title,
       hint,
       controls,
-      dirtyIndicator: dirtyIndicator === undefined ? createPersistenceIndicator() : dirtyIndicator,
+      dirtyIndicator: dirtyIndicator === undefined ? createStateIndicator() : dirtyIndicator,
       attachTooltip: tooltips.attachTooltip,
     });
 
-    const persistencePathForAccessor = (accessorName) => PERSISTENCE_ACCESSOR_PATHS[accessorName] ?? null;
+    const statePathForAccessor = (accessorName) => STATE_ACCESSOR_PATHS[accessorName] ?? null;
 
     const createHeaderControlsWithIndicator = (control, path) => {
       const controls = document.createElement('div');
       controls.className = 'helios-ui-row__controls';
-      const indicator = createPersistenceIndicator(path);
+      const indicator = createStateIndicator(path);
       if (indicator) controls.appendChild(indicator);
       controls.appendChild(control);
       return controls;
@@ -1051,14 +1633,13 @@ export class HeliosUI {
     });
     themeToggle.dataset.interfaceFocusIgnore = 'true';
     themeToggle.addEventListener('change', () => {
-      const before = this.helios?.serializeVisualizationState?.();
       this.toggleTheme();
       themeToggle.checked = this.theme === 'dark';
-      this.helios?.persistence?.recordSessionChange?.({
-        before,
-        after: this.helios?.serializeVisualizationState?.(),
-        source: 'user',
+      this._writeStateValue('ui.theme', this.theme, {
+        scope: 'user',
+        source: 'ui',
         reason: 'theme',
+        debounceMs: 0,
       });
     });
 
@@ -1066,7 +1647,7 @@ export class HeliosUI {
       title: 'Theme',
       hint: 'Toggle light/dark',
       controls: themeToggle,
-      dirtyIndicator: createPersistenceIndicator('ui.theme', 'ui'),
+      dirtyIndicator: createStateIndicator('ui.theme', 'ui'),
     });
     themeRow = built.row;
 
@@ -1079,17 +1660,36 @@ export class HeliosUI {
 
         const fileInput = document.createElement('input');
         fileInput.type = 'file';
-        fileInput.accept = '.xnet,.zxnet,.bxnet';
+        fileInput.accept = '.xnet,.zxnet,.bxnet,.gml,.gt,.gt.zst';
         fileInput.style.display = 'none';
 
         const formatSelect = document.createElement('select');
         formatSelect.className = 'helios-ui-select helios-ui-select--compact';
-        for (const fmt of ['bxnet', 'zxnet', 'xnet']) {
+        for (const fmt of ['bxnet', 'zxnet', 'xnet', 'gml', 'gt']) {
           const opt = document.createElement('option');
           opt.value = fmt;
           opt.textContent = fmt.toUpperCase();
           formatSelect.appendChild(opt);
         }
+
+        const formatWarning = document.createElement('span');
+        formatWarning.className = 'helios-ui-network__format-warning';
+        formatWarning.setAttribute('role', 'img');
+        formatWarning.setAttribute('aria-label', 'interoperability export warning');
+        formatWarning.hidden = true;
+        const warningIcon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+        warningIcon.setAttribute('viewBox', '0 0 24 24');
+        warningIcon.setAttribute('aria-hidden', 'true');
+        warningIcon.classList.add('helios-ui-network__format-warning-icon');
+        const warningPath = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+        warningPath.setAttribute('d', 'M10.3 4.4 2.5 18a2 2 0 0 0 1.7 3h15.6a2 2 0 0 0 1.7-3L13.7 4.4a2 2 0 0 0-3.4 0ZM12 9v5m0 3h.01');
+        warningPath.setAttribute('fill', 'none');
+        warningPath.setAttribute('stroke', 'currentColor');
+        warningPath.setAttribute('stroke-width', '2');
+        warningPath.setAttribute('stroke-linecap', 'round');
+        warningPath.setAttribute('stroke-linejoin', 'round');
+        warningIcon.appendChild(warningPath);
+        formatWarning.appendChild(warningIcon);
 
         const loadButton = document.createElement('button');
         loadButton.type = 'button';
@@ -1119,6 +1719,7 @@ export class HeliosUI {
         // Simple, readable icons (stroke, currentColor).
         const loadIcon = makeIcon('M12 3v10m0 0l-4-4m4 4l4-4M4 17v3h16v-3');
         const saveIcon = makeIcon('M12 21V11m0 0l-4 4m4-4l4 4M4 7V4h16v3');
+        const syncIcon = makeIcon('M21 12a9 9 0 0 1-15.5 6.2M3 12A9 9 0 0 1 18.5 5.8M18 3v4h-4M6 21v-4h4');
 
         const loadText = document.createElement('span');
         loadText.textContent = 'Load';
@@ -1129,9 +1730,44 @@ export class HeliosUI {
         saveButton.appendChild(saveIcon);
         saveButton.appendChild(saveText);
 
-        tooltips.attachTooltip(loadButton, 'Load a network file (.xnet/.zxnet/.bxnet)');
-        tooltips.attachTooltip(saveButton, 'Save the current network as a file');
+        tooltips.attachTooltip(loadButton, 'Load a network file (.xnet/.zxnet/.bxnet/.gml/.gt/.gt.zst)');
+        tooltips.attachTooltip(saveButton, 'Save the current network, visualization state, and positions as a file');
         tooltips.attachTooltip(formatSelect, 'Select export format');
+        tooltips.attachTooltip(formatWarning, 'GML and GT exports are interoperability formats: private Helios state and unsupported attribute types may be skipped, renamed, or stringified.');
+
+        const syncContainer = document.createElement('div');
+        syncContainer.className = 'helios-ui-network-persistence';
+        const syncStatus = document.createElement('span');
+        syncStatus.className = 'helios-ui-network-persistence__status';
+        syncStatus.textContent = 'Not synced';
+        const syncControls = document.createElement('div');
+        syncControls.className = 'helios-ui-network-persistence__controls';
+        const syncButton = document.createElement('button');
+        syncButton.type = 'button';
+        syncButton.className = 'helios-ui-button helios-ui-button--icon helios-ui-network-persistence__sync';
+        syncButton.setAttribute('aria-label', 'Synchronize persistence');
+        syncButton.appendChild(syncIcon);
+        syncControls.appendChild(syncButton);
+        syncContainer.appendChild(syncControls);
+        syncContainer.appendChild(syncStatus);
+        tooltips.attachTooltip(syncButton, 'Synchronize settings, network metadata, and positions');
+
+        const autoSyncGroup = document.createElement('div');
+        autoSyncGroup.className = 'helios-ui-network-autosync';
+        const autoSyncLabel = document.createElement('span');
+        autoSyncLabel.className = 'helios-ui-network-autosync__label';
+        autoSyncLabel.textContent = 'Auto Sync';
+        const autoSyncToggle = createToggleControl({
+          checked: this.helios?.states?.get?.('network.persistence.autosave', true) !== false,
+          onLabel: 'On',
+          offLabel: 'Off',
+          ariaLabel: 'Auto sync network persistence',
+          className: 'helios-ui-toggle helios-ui-toggle--compact helios-ui-network-autosync__toggle',
+        });
+        autoSyncGroup.appendChild(autoSyncLabel);
+        autoSyncGroup.appendChild(autoSyncToggle);
+        tooltips.attachTooltip(autoSyncToggle, 'Automatically synchronize network state and positions when they change');
+        syncControls.appendChild(autoSyncGroup);
 
         const controls = document.createElement('div');
         controls.className = 'helios-ui-network__actions';
@@ -1140,11 +1776,345 @@ export class HeliosUI {
         controls.appendChild(loadButton);
         controls.appendChild(saveButton);
         controls.appendChild(formatSelect);
+        controls.appendChild(formatWarning);
         controls.appendChild(fileInput);
+
+        const formatRelativeSyncTime = (timestamp) => {
+          if (!Number.isFinite(timestamp)) return null;
+          const elapsed = Math.max(0, Date.now() - Number(timestamp));
+          if (elapsed < 60000) return `${Math.floor(elapsed / 1000)}s ago`;
+          if (elapsed < 3600000) return `${Math.floor(elapsed / 60000)}m ago`;
+          return `${Math.floor(elapsed / 3600000)}h ago`;
+        };
+
+        const resolveNetworkPayloadSavedAt = (status) => {
+          const savedAt = Number(status?.networkData?.savedAt);
+          return Number.isFinite(savedAt) && savedAt > 0 ? savedAt : null;
+        };
+
+        const showNetworkFileActions = options.showNetworkFileActions !== false;
+        const showPersistenceSync = options.showPersistenceSync !== false && storageSupportsPersistentUI(this.helios);
+        const showSessionTab = options.showSessionTab !== false && storageSupportsSessions(this.helios);
+
+        const syncPersistenceStatus = () => {
+          if (!showPersistenceSync) return;
+          const storage = this.helios?.storage ?? null;
+          const status = storage?.persistenceStatus?.() ?? storage?.status?.() ?? null;
+          const networkData = status?.networkData ?? {};
+          const backendStatus = status?.backendStatus ?? [];
+          const failed = backendStatus.find((entry) => entry?.ok === false) ?? null;
+          const failureMessage = failed?.error
+            ?? status?.sessionSync?.error
+            ?? status?.lastError
+            ?? networkData.remoteWarning
+            ?? '';
+          const syncWarning = status?.sessionSync?.warning
+            ?? status?.lastWarning
+            ?? networkData.syncWarning
+            ?? '';
+          const logSyncFailure = () => {
+            if (!failureMessage) return;
+            const key = JSON.stringify({
+              message: failureMessage,
+              backend: failed?.id ?? failed?.name ?? failed?.type ?? null,
+              sessionId: status?.sessionId ?? null,
+            });
+            if (this._lastLoggedSyncFailure === key || LOGGED_SYNC_FAILURE_KEYS.has(key)) return;
+            this._lastLoggedSyncFailure = key;
+            LOGGED_SYNC_FAILURE_KEYS.add(key);
+            if (LOGGED_SYNC_FAILURE_KEYS.size > MAX_LOGGED_SYNC_FAILURE_KEYS) {
+              const [oldest] = LOGGED_SYNC_FAILURE_KEYS;
+              LOGGED_SYNC_FAILURE_KEYS.delete(oldest);
+            }
+            console.error('[HeliosStorage] Sync failed', {
+              error: failureMessage,
+              backend: failed ?? null,
+              status,
+            });
+          };
+          const savedAt = resolveNetworkPayloadSavedAt(status);
+          const hasSavedAt = savedAt != null;
+          const cleanSyncedText = hasSavedAt ? 'Synced' : null;
+          const lastSyncedText = hasSavedAt ? `Last synced ${formatRelativeSyncTime(savedAt)}.` : '';
+          const networkPersistenceEnabled = this.helios?.states?.get?.('network.persistence.enabled', networkData.enabled !== false) !== false;
+          const autosyncDisabledReason = networkData.autosyncDisabledReason?.message
+            ?? (networkData.autosyncDisabled === true
+              ? 'Auto sync is disabled for this session. Use manual Sync to save changes.'
+              : '');
+          const autosyncDisabled = networkData.autosyncDisabled === true;
+          autoSyncToggle.checked = autosyncDisabled
+            ? false
+            : this.helios?.states?.get?.('network.persistence.autosave', true) !== false;
+          autoSyncToggle.disabled = !networkPersistenceEnabled || autosyncDisabled;
+          autoSyncGroup.title = autosyncDisabledReason;
+          autoSyncToggle.title = autosyncDisabledReason;
+          autoSyncGroup.dataset.state = autosyncDisabled ? 'disabled' : 'enabled';
+          syncButton.title = '';
+          if (status?.syncing || networkData.status === 'syncing') {
+            syncStatus.textContent = syncWarning ? 'Sync still running' : 'Syncing...';
+            syncButton.dataset.state = 'syncing';
+            syncButton.disabled = true;
+            syncButton.title = syncWarning;
+          } else if (networkData.status === 'skipped' && networkData.skipped?.reason === 'size-limit') {
+            syncStatus.textContent = 'Network too large';
+            syncButton.dataset.state = 'error';
+            syncButton.disabled = false;
+            syncButton.title = 'Network autosave was skipped because the payload is larger than the configured storage limit.';
+          } else if (failed || status?.sessionSync?.status === 'error' || status?.lastError || networkData.remoteWarning) {
+            logSyncFailure();
+            syncStatus.textContent = 'Sync failed';
+            syncButton.dataset.state = 'error';
+            syncButton.disabled = false;
+            syncButton.title = failureMessage;
+          } else if (networkData.positionsDirty) {
+            syncStatus.textContent = 'Unsynced positions';
+            syncButton.dataset.state = 'dirty';
+            syncButton.disabled = false;
+            syncButton.title = `${lastSyncedText} Position changes will sync after interaction idle and the autosync debounce.`.trim();
+          } else if (networkData.dirty) {
+            syncStatus.textContent = 'Unsynced changes';
+            syncButton.dataset.state = 'dirty';
+            syncButton.disabled = false;
+            syncButton.title = `${lastSyncedText} Session changes will sync after interaction idle and the autosync debounce.`.trim();
+          } else if (hasSavedAt) {
+            syncStatus.textContent = cleanSyncedText;
+            syncButton.dataset.state = 'saved';
+            syncButton.disabled = false;
+          } else {
+            syncStatus.textContent = '';
+            syncButton.dataset.state = 'idle';
+            syncButton.disabled = false;
+          }
+        };
+
+        const syncPersistenceStatusForChange = (event) => {
+          const detail = event?.detail && typeof event.detail === 'object' ? event.detail : {};
+          const reason = String(detail.reason ?? '');
+          const networkStatus = detail.status?.networkData && typeof detail.status.networkData === 'object'
+            ? detail.status.networkData
+            : null;
+          const cleanSaved = networkStatus?.status === 'saved'
+            && networkStatus.dirty !== true
+            && networkStatus.positionsDirty !== true;
+          const failed = networkStatus?.status === 'error'
+            || networkStatus?.status === 'skipped'
+            || Boolean(networkStatus?.remoteWarning)
+            || Boolean(detail.error)
+            || Boolean(detail.warning)
+            || detail.status?.sessionSync?.status === 'error';
+          const syncEvent = reason === 'session-save-start'
+            || reason === 'session-save-warning'
+            || reason === 'session-save-error'
+            || reason === 'session-restore-error'
+            || reason === 'explicit-session-missing';
+          if (reason === 'load' || reason === 'autosync-size-limit' || reason === 'autosync-disabled' || syncEvent || cleanSaved || failed) {
+            syncPersistenceStatus();
+            return;
+          }
+          const entries = Array.isArray(detail.entries) ? detail.entries : [];
+          if (entries.some((entry) => {
+            const path = String(entry?.path ?? '');
+            return path.startsWith('network.persistence') || path.startsWith('positions.persistence');
+          })) {
+            syncPersistenceStatus();
+          }
+        };
+
+        const currentSessionLoadConfirmationInfo = () => {
+          const storage = this.helios?.storage ?? null;
+          if (!storageSupportsSessions(this.helios) || !storage) return null;
+          const status = storage.persistenceStatus?.() ?? storage.status?.() ?? null;
+          if (!status || !status.sessionId) return null;
+          const networkData = status.networkData ?? {};
+          const sessionSync = status.sessionSync ?? {};
+          const savedAt = resolveNetworkPayloadSavedAt(status);
+          const needsConfirmation = status.syncing === true
+            || sessionSync.pending === true
+            || networkData.dirty === true
+            || networkData.positionsDirty === true
+            || Boolean(status.lastError)
+            || Boolean(networkData.remoteWarning)
+            || sessionSync.status === 'error'
+            || storage.hasPendingStateChanges?.() === true
+            || savedAt == null;
+          if (!needsConfirmation) return null;
+          let reason = 'The current session is not fully synced.';
+          if (status.syncing === true || sessionSync.pending === true) {
+            reason = 'A session sync is still running.';
+          } else if (status.lastError || networkData.remoteWarning || sessionSync.status === 'error') {
+            reason = 'The last session sync failed.';
+          } else if (networkData.positionsDirty === true) {
+            reason = 'The current session has unsynced position changes.';
+          } else if (networkData.dirty === true || storage.hasPendingStateChanges?.() === true) {
+            reason = 'The current session has unsynced changes.';
+          } else if (savedAt == null) {
+            reason = 'The current session has never been synced.';
+          }
+          return {
+            status,
+            reason,
+            syncSummary: savedAt == null ? 'Not synced yet.' : `Last synced ${formatRelativeSyncTime(savedAt)}.`,
+          };
+        };
+
+        const showThemedConfirmationDialog = ({
+          title,
+          message,
+          detail = '',
+          confirmLabel = 'Continue',
+          cancelLabel = 'Cancel',
+          confirmClass = '',
+          onConfirm = null,
+        } = {}) => new Promise((resolve) => {
+          const doc = this.container?.ownerDocument ?? document;
+          if (!doc?.createElement) {
+            resolve(false);
+            return;
+          }
+          const dialog = doc.createElement('dialog');
+          dialog.className = 'helios-ui-dialog';
+          dialog.setAttribute('aria-label', title ?? 'Confirm action');
+
+          const titleEl = doc.createElement('div');
+          titleEl.className = 'helios-ui-dialog__title';
+          titleEl.textContent = title ?? 'Confirm';
+
+          const messageEl = doc.createElement('div');
+          messageEl.className = 'helios-ui-dialog__body';
+          messageEl.textContent = message ?? '';
+
+          const detailEl = doc.createElement('div');
+          detailEl.className = 'helios-ui-dialog__meta';
+          detailEl.textContent = detail ?? '';
+          detailEl.hidden = !detailEl.textContent;
+
+          const actions = doc.createElement('div');
+          actions.className = 'helios-ui-dialog__actions';
+
+          const cancel = doc.createElement('button');
+          cancel.type = 'button';
+          cancel.className = 'helios-ui-button';
+          cancel.textContent = cancelLabel;
+
+          const confirm = doc.createElement('button');
+          confirm.type = 'button';
+          confirm.className = `helios-ui-button ${confirmClass}`.trim();
+          confirm.textContent = confirmLabel;
+
+          actions.appendChild(cancel);
+          actions.appendChild(confirm);
+          dialog.appendChild(titleEl);
+          dialog.appendChild(messageEl);
+          dialog.appendChild(detailEl);
+          dialog.appendChild(actions);
+
+          const parent = this.container ?? doc.body;
+          const close = (value) => {
+            if (typeof dialog.close === 'function' && dialog.open) dialog.close();
+            dialog.remove();
+            resolve(value);
+          };
+          cancel.addEventListener('click', () => close(false));
+          confirm.addEventListener('click', () => {
+            if (typeof dialog.close === 'function' && dialog.open) dialog.close();
+            dialog.remove();
+            if (typeof onConfirm === 'function') onConfirm();
+            resolve(true);
+          });
+          dialog.addEventListener('cancel', (event) => {
+            event.preventDefault();
+            close(false);
+          });
+          parent.appendChild(dialog);
+          if (typeof dialog.showModal === 'function') dialog.showModal();
+          else dialog.setAttribute('open', '');
+          globalThis.setTimeout(() => confirm.focus(), 0);
+        });
+
+        const confirmOpenNetworkReplacement = async ({ sourceName = null } = {}) => {
+          const info = currentSessionLoadConfirmationInfo();
+          if (!info) return true;
+          const sourceLabel = sourceName ? ` "${sourceName}"` : '';
+          return showThemedConfirmationDialog({
+            title: 'Open Network',
+            message: `Opening${sourceLabel} will replace the current network and start a new session. Helios will try to sync the current session first; if that sync fails, you will be asked again before continuing.`,
+            detail: `${info.syncSummary} ${info.reason}`,
+            confirmLabel: 'Open Network',
+          });
+        };
+
+        const showOpenNetworkConfirmationDialog = (onConfirm) => {
+          void confirmOpenNetworkReplacement().then((confirmed) => {
+            if (confirmed && typeof onConfirm === 'function') onConfirm();
+          });
+        };
+
+        const confirmContinueWithoutSync = async ({ error, previousId, status, sourceName = null } = {}) => {
+          const previousLabel = previousId ? ` (${previousId})` : '';
+          const savedAt = resolveNetworkPayloadSavedAt(status);
+          const syncSummary = savedAt == null ? 'Not synced yet.' : `Last synced ${formatRelativeSyncTime(savedAt)}.`;
+          const errorMessage = error?.message ? ` ${error.message}` : '';
+          const sourceLabel = sourceName ? ` "${sourceName}"` : '';
+          return showThemedConfirmationDialog({
+            title: 'Continue Without Sync?',
+            message: `Helios could not sync the current session${previousLabel} before opening${sourceLabel}. Continue anyway? Unsynced changes in the previous session may be lost.`,
+            detail: `${syncSummary}${errorMessage}`,
+            confirmLabel: 'Continue',
+            confirmClass: 'helios-ui-button--danger',
+          });
+        };
+
+        this.helios._confirmNetworkLoadFromUi = confirmOpenNetworkReplacement;
+        this.helios._confirmUnsyncedSessionFromUi = confirmContinueWithoutSync;
+        this._controlCleanups.add(() => {
+          if (this.helios?._confirmNetworkLoadFromUi === confirmOpenNetworkReplacement) {
+            this.helios._confirmNetworkLoadFromUi = null;
+          }
+          if (this.helios?._confirmUnsyncedSessionFromUi === confirmContinueWithoutSync) {
+            this.helios._confirmUnsyncedSessionFromUi = null;
+          }
+        });
+
+        const syncStatusInterval = showPersistenceSync
+          ? setInterval(syncPersistenceStatus, 10000)
+          : null;
+        if (syncStatusInterval != null) {
+          this._controlCleanups.add(() => clearInterval(syncStatusInterval));
+        }
+
+        syncButton.addEventListener('click', async () => {
+          syncButton.disabled = true;
+          syncButton.dataset.state = 'syncing';
+          syncStatus.textContent = 'Syncing...';
+          try {
+            await this.helios?.storage?.sync?.({
+              includeNetwork: true,
+              includePositions: true,
+              retention: { enabled: false },
+            });
+          } catch (error) {
+            console.error('[HeliosStorage] Manual sync failed', error);
+          } finally {
+            syncPersistenceStatus();
+          }
+        });
+
+        autoSyncToggle.addEventListener('change', () => {
+          const stateStore = this.helios?.states ?? null;
+          stateStore?.set?.('network.persistence.autosave', autoSyncToggle.checked, {
+            scope: 'workspace',
+            source: 'ui',
+            reason: 'network-autosync-toggle',
+          });
+          this.helios?.storage?.configure?.({
+            networkPersistence: { autosave: autoSyncToggle.checked },
+          });
+          syncPersistenceStatus();
+        });
 
         let baseName = this.helios._lastLoadedNetworkBase ?? 'network';
         let loadedFormat = this.helios._lastLoadedNetworkFormat ?? null;
-        if (loadedFormat && ['bxnet', 'zxnet', 'xnet'].includes(loadedFormat)) {
+        if (loadedFormat && ['bxnet', 'zxnet', 'xnet', 'gml', 'gt'].includes(loadedFormat)) {
           formatSelect.value = loadedFormat;
         }
 
@@ -1173,6 +2143,9 @@ export class HeliosUI {
         nameBar.className = 'helios-ui-network__name';
         nameBar.style.marginTop = '6px';
 
+        const syncRow = document.createElement('div');
+        syncRow.className = 'helios-ui-network__sync-row';
+
         const nameInput = document.createElement('input');
         nameInput.type = 'text';
         nameInput.className = 'helios-ui-text';
@@ -1188,6 +2161,7 @@ export class HeliosUI {
 
         const syncExtension = () => {
           extEl.textContent = `.${formatSelect.value}`;
+          formatWarning.hidden = formatSelect.value !== 'gml' && formatSelect.value !== 'gt';
         };
         syncExtension();
 
@@ -1226,6 +2200,16 @@ export class HeliosUI {
           }
         };
 
+        const syncBaseNameFromHelios = () => {
+          const candidate = sanitizeBaseName(this.helios?._lastLoadedNetworkBase ?? '');
+          if (!candidate || candidate === lastValidBaseName) return;
+          baseName = candidate;
+          lastValidBaseName = candidate;
+          if (nameInput.value !== candidate) nameInput.value = candidate;
+          if (exportNameInput.value !== candidate) exportNameInput.value = candidate;
+          exporterBehavior?.baseName?.(candidate);
+        };
+
         nameInput.addEventListener('blur', () => commitBaseName(nameInput));
         nameInput.addEventListener('keydown', (e) => {
           if (e.key === 'Enter') {
@@ -1246,6 +2230,9 @@ export class HeliosUI {
 
         nameBar.appendChild(nameInput);
         nameBar.appendChild(extEl);
+        if (showPersistenceSync) {
+          syncRow.appendChild(syncContainer);
+        }
 
         const stats = document.createElement('div');
         stats.className = 'helios-ui-stats helios-ui-network__stats';
@@ -1271,6 +2258,7 @@ export class HeliosUI {
           const directed = Boolean(network?.directed);
           const avgDegree = nodes ? (directed ? edges / nodes : (2 * edges) / nodes) : 0;
 
+          syncBaseNameFromHelios();
           syncExtension();
           nodesValue.textContent = String(nodes);
           edgesValue.textContent = String(edges);
@@ -1279,11 +2267,225 @@ export class HeliosUI {
         };
 
         refreshNetworkInfo();
+        if (showPersistenceSync) syncPersistenceStatus();
 
         const networkTab = document.createElement('div');
         networkTab.appendChild(stats);
-        networkTab.appendChild(controls);
-        networkTab.appendChild(nameBar);
+        if (showNetworkFileActions) {
+          networkTab.appendChild(controls);
+          networkTab.appendChild(nameBar);
+        }
+        if (showPersistenceSync) networkTab.appendChild(syncRow);
+
+        const sessionTab = document.createElement('div');
+        sessionTab.className = 'helios-ui-session-tab';
+        const sessionHeader = document.createElement('div');
+        sessionHeader.className = 'helios-ui-session-tab__header';
+        const currentSession = document.createElement('div');
+        currentSession.className = 'helios-ui-session-tab__current';
+        const currentSessionLabel = document.createElement('div');
+        currentSessionLabel.className = 'helios-ui-session-tab__current-label';
+        currentSessionLabel.textContent = 'Current';
+        const currentSessionId = document.createElement('div');
+        currentSessionId.className = 'helios-ui-session-tab__current-id';
+        currentSession.appendChild(currentSessionLabel);
+        currentSession.appendChild(currentSessionId);
+        const sessionActions = document.createElement('div');
+        sessionActions.className = 'helios-ui-session-tab__actions';
+        const newSessionButton = document.createElement('button');
+        newSessionButton.type = 'button';
+        newSessionButton.className = 'helios-ui-button';
+        newSessionButton.textContent = 'Save Session';
+        const refreshSessionsButton = document.createElement('button');
+        refreshSessionsButton.type = 'button';
+        refreshSessionsButton.className = 'helios-ui-button helios-ui-button--icon';
+        refreshSessionsButton.setAttribute('aria-label', 'Refresh sessions');
+        refreshSessionsButton.appendChild(makeIcon('M21 12a9 9 0 0 1-15.5 6.2M3 12A9 9 0 0 1 18.5 5.8M18 3v4h-4M6 21v-4h4'));
+        sessionActions.appendChild(newSessionButton);
+        sessionActions.appendChild(refreshSessionsButton);
+        sessionHeader.appendChild(currentSession);
+        sessionHeader.appendChild(sessionActions);
+        const sessionList = document.createElement('div');
+        sessionList.className = 'helios-ui-session-tab__list';
+        sessionTab.appendChild(sessionHeader);
+        sessionTab.appendChild(sessionList);
+        tooltips.attachTooltip(newSessionButton, 'Save the current network state as a restorable session');
+        tooltips.attachTooltip(refreshSessionsButton, 'Refresh saved sessions');
+
+        const refreshSessionTab = async () => {
+          const storage = this.helios?.storage ?? null;
+          const currentId = storage?.sessionId ?? null;
+          currentSessionId.textContent = currentId || 'none';
+          sessionList.replaceChildren();
+          if (!storage?.capabilities?.sessions) {
+            const empty = document.createElement('div');
+            empty.className = 'helios-ui-label__hint';
+            empty.textContent = 'Session persistence is not enabled.';
+            sessionList.appendChild(empty);
+            return;
+          }
+          let sessions = [];
+          try {
+            const sessionSource = typeof storage?.listSessionSummaries === 'function' ? storage : persistence;
+            sessions = await sessionSource.listSessionSummaries({
+              includeFinished: false,
+              includeAllWorkspaces: true,
+            });
+          } catch (error) {
+            const empty = document.createElement('div');
+            empty.className = 'helios-ui-label__hint';
+            empty.textContent = `Could not load sessions: ${error?.message ?? error}`;
+            sessionList.appendChild(empty);
+            return;
+          }
+          const visibleSessions = sessions.filter((entry) => entry?.id);
+          if (!visibleSessions.length) {
+            const empty = document.createElement('div');
+            empty.className = 'helios-ui-label__hint';
+            empty.textContent = 'No saved sessions.';
+            sessionList.appendChild(empty);
+            return;
+          }
+          for (let i = 0; i < visibleSessions.length; i += 1) {
+            const session = visibleSessions[i];
+            const isCurrent = currentId != null && String(session.id) === String(currentId);
+            const row = document.createElement('div');
+            row.className = 'helios-ui-session-tab__row';
+            row.dataset.current = isCurrent ? 'true' : 'false';
+            row.dataset.sessionId = session.id;
+            const updatedAt = Number(session.updatedAt);
+            const thumbnailCapturedAt = Number(session.thumbnail?.capturedAt);
+            const thumbnailIsFreshForCurrent = !isCurrent
+              || !Number.isFinite(updatedAt)
+              || !Number.isFinite(thumbnailCapturedAt)
+              || thumbnailCapturedAt >= updatedAt;
+            const thumbnail = session.thumbnail?.dataUrl && thumbnailIsFreshForCurrent
+              ? document.createElement('img')
+              : null;
+            if (thumbnail) {
+              row.classList.add('helios-ui-session-tab__row--with-thumbnail');
+              thumbnail.className = 'helios-ui-session-tab__thumbnail';
+              thumbnail.src = session.thumbnail.dataUrl;
+              thumbnail.alt = '';
+              thumbnail.loading = 'lazy';
+            }
+            const details = document.createElement('div');
+            details.className = 'helios-ui-session-tab__details';
+            const title = document.createElement('div');
+            title.className = 'helios-ui-session-tab__title';
+            const compactUpdated = Number.isFinite(updatedAt) && updatedAt > 0
+              ? new Date(updatedAt).toLocaleString(undefined, {
+                month: 'short',
+                day: 'numeric',
+                hour: 'numeric',
+                minute: '2-digit',
+              })
+              : 'unknown date';
+            const networkName = String(
+              session.networkSource?.baseName
+              ?? session.networkSource?.name
+              ?? this.helios?._lastLoadedNetworkBase
+              ?? 'network',
+            ).trim() || 'network';
+            const nickname = String(session.nickname ?? '').trim();
+            const primaryName = nickname || networkName || `Session ${i + 1}`;
+            title.textContent = `${primaryName} - ${compactUpdated}`;
+            const meta = document.createElement('div');
+            meta.className = 'helios-ui-session-tab__meta';
+            const updated = Number.isFinite(updatedAt) && updatedAt > 0
+              ? new Date(updatedAt).toLocaleString()
+              : 'unknown date';
+            const bytes = Number.isFinite(session.bytes) && session.bytes > 0
+              ? `${Math.max(1, Math.round(session.bytes / 1024))} KB`
+              : 'unknown size';
+            const idLine = document.createElement('div');
+            idLine.className = 'helios-ui-session-tab__meta-line helios-ui-session-tab__meta-line--id';
+            idLine.textContent = String(session.id);
+            const updatedLine = document.createElement('div');
+            updatedLine.className = 'helios-ui-session-tab__meta-line';
+            updatedLine.textContent = `latest ${updated} · ${bytes}`;
+            meta.appendChild(idLine);
+            meta.appendChild(updatedLine);
+            details.appendChild(meta);
+            const resume = document.createElement('button');
+            resume.type = 'button';
+            resume.className = 'helios-ui-button';
+            resume.textContent = isCurrent ? 'Current' : 'Resume';
+            resume.disabled = isCurrent;
+            resume.addEventListener('click', async () => {
+              if (isCurrent) return;
+              resume.disabled = true;
+              try {
+                const sessionSource = storage;
+                await (this.interfaceBehavior?.resumeSession?.({ sessionId: session.id })
+                  ?? sessionSource?.resumeSession?.(session.id)
+                  ?? sessionSource?.restoreSession?.(session.id));
+                await storage?.sync?.({
+                  includeNetwork: true,
+                  includePositions: true,
+                  retention: { enabled: false },
+                });
+                refreshNetworkInfo();
+                syncPersistenceStatus();
+              } finally {
+                resume.disabled = false;
+              }
+            });
+            const deleteButton = document.createElement('button');
+            deleteButton.type = 'button';
+            deleteButton.className = 'helios-ui-button helios-ui-button--icon helios-ui-session-tab__delete';
+            deleteButton.setAttribute('aria-label', `Delete session ${primaryName}`);
+            deleteButton.appendChild(makeIcon('M3 6h18M8 6V4h8v2M6.5 6l1 14h9l1-14M10 10v6M14 10v6'));
+            tooltips.attachTooltip(deleteButton, 'Delete this saved session');
+            deleteButton.addEventListener('click', async () => {
+              const confirmed = globalThis.confirm?.(`Delete saved session "${primaryName}"? This cannot be undone.`) ?? false;
+              if (!confirmed) return;
+              deleteButton.disabled = true;
+              resume.disabled = true;
+              try {
+                await (storage ?? persistence)?.deleteSession?.(session.id);
+                await refreshSessionTab();
+              } finally {
+                deleteButton.disabled = false;
+                resume.disabled = isCurrent;
+              }
+            });
+            const rowActions = document.createElement('div');
+            rowActions.className = 'helios-ui-session-tab__row-actions';
+            rowActions.appendChild(resume);
+            rowActions.appendChild(deleteButton);
+            const body = document.createElement('div');
+            body.className = 'helios-ui-session-tab__body';
+            if (thumbnail) body.appendChild(thumbnail);
+            body.appendChild(details);
+            body.appendChild(rowActions);
+            row.appendChild(title);
+            row.appendChild(body);
+            sessionList.appendChild(row);
+          }
+        };
+
+        newSessionButton.addEventListener('click', async () => {
+          newSessionButton.disabled = true;
+          try {
+            const storage = this.helios?.storage ?? null;
+            const nickname = this.helios?._lastLoadedNetworkBase ?? this.helios?._lastLoadedNetworkName ?? 'network';
+            await storage?.saveSession?.({
+              nickname,
+              networkFormat: 'zxnet',
+              includeNetwork: true,
+              includePositions: true,
+              retention: { enabled: false },
+            });
+            syncPersistenceStatus();
+            await refreshSessionTab();
+          } finally {
+            newSessionButton.disabled = false;
+          }
+        });
+        refreshSessionsButton.addEventListener('click', () => {
+          void refreshSessionTab();
+        });
 
         const attributesTab = document.createElement('div');
         const attributesHeader = document.createElement('div');
@@ -1877,7 +3079,9 @@ export class HeliosUI {
         exportTabContent.appendChild(previewStack.element);
         exportTab.appendChild(exportTabContent);
 
-        loadButton.addEventListener('click', () => fileInput.click());
+        loadButton.addEventListener('click', () => {
+          showOpenNetworkConfirmationDialog(() => fileInput.click());
+        });
         fileInput.addEventListener('change', async () => {
           const file = fileInput.files?.[0] ?? null;
           fileInput.value = '';
@@ -1885,7 +3089,15 @@ export class HeliosUI {
           loadButton.disabled = true;
           saveButton.disabled = true;
           try {
-            await this.helios.loadNetwork(file, { disposeOld: true, recreateRenderer: true, keepCamera: false });
+            await this.helios.loadNetwork(file, {
+              disposeOld: true,
+              recreateRenderer: true,
+              keepCamera: false,
+              confirmUnsyncedSession: (detail) => confirmContinueWithoutSync({
+                ...detail,
+                sourceName: file.name,
+              }),
+            });
             const nextBase = this.helios._lastLoadedNetworkBase ?? file.name.replace(/\.[^.]+$/, '');
             const sanitized = sanitizeBaseName(nextBase);
             if (sanitized) {
@@ -1896,8 +3108,9 @@ export class HeliosUI {
               exporterBehavior?.baseName?.(sanitized);
             }
             loadedFormat = this.helios._lastLoadedNetworkFormat ?? loadedFormat;
-            if (loadedFormat && ['bxnet', 'zxnet', 'xnet'].includes(loadedFormat)) {
+            if (loadedFormat && ['bxnet', 'zxnet', 'xnet', 'gml', 'gt'].includes(loadedFormat)) {
               formatSelect.value = loadedFormat;
+              syncExtension();
             }
           } catch (error) {
             // eslint-disable-next-line no-console
@@ -1915,20 +3128,34 @@ export class HeliosUI {
           try {
             commitBaseName(nameInput);
             const fmt = formatSelect.value;
-            const blob = await this.helios.savePortableNetwork?.(fmt, {
-              output: 'blob',
-              includeVisualization: true,
-              trackedOnly: true,
-            }) ?? await this.helios.saveNetwork(fmt, { output: 'blob' });
+            let blob = null;
+            if (fmt === 'gml' || fmt === 'gt') {
+              await this.helios.syncDelegatePositionsToNetwork?.();
+              blob = await this.helios.saveNetwork(fmt, { output: 'blob' });
+            } else {
+              const saveOptions = {
+                output: 'blob',
+                includeVisualization: true,
+                includeCurrentPositions: true,
+                fullVisualizationState: true,
+                layoutRuntime: { preferDelegate: true },
+                storage: { includeJournal: false },
+              };
+              blob = await this.helios.storage?.saveNetworkSnapshot?.(fmt, saveOptions)
+                ?? await this.helios.savePortableNetwork?.(fmt, saveOptions)
+                ?? await this.helios.saveNetwork(fmt, { output: 'blob' });
+            }
             if (blob) {
               const filename = `${lastValidBaseName}.${fmt}`;
               downloadBlob(blob, filename);
             }
+            await this.helios.storage?.sync?.({ includeNetwork: true, includePositions: true });
           } catch (error) {
             // eslint-disable-next-line no-console
             console.error('Failed to save network', error);
           } finally {
-              refreshNetworkInfo();
+            refreshNetworkInfo();
+            syncPersistenceStatus();
             saveButton.disabled = false;
             loadButton.disabled = false;
           }
@@ -1943,7 +3170,7 @@ export class HeliosUI {
             const blob = exporterBehavior
               ? await exporterBehavior.exportBlob()
               : await this.helios.exportFigureBlob(resolved);
-            downloadBlob(blob, normalizeFigureExportFilename(exportNameInput.value, resolved.format, lastValidBaseName));
+            downloadBlob(blob, resolved.filename);
           } catch (error) {
             // eslint-disable-next-line no-console
             console.error('Failed to export figure', error);
@@ -1952,12 +3179,16 @@ export class HeliosUI {
           }
         });
 
-        formatSelect.addEventListener('change', () => refreshNetworkInfo());
+        formatSelect.addEventListener('change', () => {
+          syncExtension();
+          refreshNetworkInfo();
+        });
 
         // Update stats if the network is replaced externally.
         const onNetworkReplaced = () => {
           attachAttributeListeners();
           refreshNetworkInfo();
+          syncPersistenceStatus();
           renderAttributesTable();
           syncExportUi();
         };
@@ -1969,6 +3200,11 @@ export class HeliosUI {
           unsub = () => this.helios.removeEventListener('network:replaced', onNetworkReplaced);
         }
         if (unsub) this._controlCleanups.add(unsub);
+        const storageManager = this.helios?.storage ?? null;
+        storageManager?.addEventListener?.('change', syncPersistenceStatusForChange);
+        this._controlCleanups.add(() => {
+          storageManager?.removeEventListener?.('change', syncPersistenceStatusForChange);
+        });
         if (exporterBehavior) {
           exporterBehavior.baseName?.(lastValidBaseName);
           applyExporterStateToControls();
@@ -2038,21 +3274,25 @@ export class HeliosUI {
           }
         });
 
+        const dataTabs = [
+          { id: 'network', title: 'Network', content: networkTab },
+          { id: 'figure', title: 'Figure', content: exportTab },
+          { id: 'attributes', title: 'Attributes', content: attributesTab },
+        ];
+        if (showSessionTab) dataTabs.push({ id: 'session', title: 'Session', content: sessionTab });
+
         const tabs = new TabbedPanel({
           variant: 'panel',
           onActiveChanged: (id) => {
             figureTabActive = id === 'figure';
             syncExportUi();
           },
-          tabs: [
-            { id: 'network', title: 'Network', content: networkTab },
-            { id: 'figure', title: 'Figure', content: exportTab },
-            { id: 'attributes', title: 'Attributes', content: attributesTab },
-          ],
+          tabs: dataTabs,
         });
         this._controlCleanups.add(() => tabs.destroy());
         container.appendChild(tabs.element);
         syncExportUi();
+        if (showSessionTab) void refreshSessionTab();
         return container;
       })();
 
@@ -2066,10 +3306,12 @@ export class HeliosUI {
           if (info?.type && info.type !== 'number') continue;
           if (typeof source?.[accessorName] !== 'function') continue;
           const attribute = bind(accessorName);
-          const path = persistencePathForAccessor(accessorName);
+          const label = attribute.label ?? info?.label ?? humanizeControlLabel(accessorName);
+          const path = statePathForAccessor(accessorName);
           const row = createSliderRow(attribute, {
+            title: label,
             hint: info?.description ?? null,
-            dirtyIndicator: createPersistenceIndicator(path),
+            dirtyIndicator: createStateIndicator(path),
           });
           container.appendChild(row.element);
           this._controlCleanups.add(row.destroy);
@@ -2085,11 +3327,12 @@ export class HeliosUI {
         if (!info || info.type !== 'boolean') return null;
         if (typeof source?.[accessorName] !== 'function') return null;
         const attribute = bind(accessorName);
+        const label = attribute.label ?? info.label ?? humanizeControlLabel(accessorName);
         const toggle = createToggleControl({
           checked: false,
           onLabel: 'On',
           offLabel: 'Off',
-          ariaLabel: info.label ?? accessorName,
+          ariaLabel: label,
           disabled: attribute.readOnly,
         });
 
@@ -2111,10 +3354,10 @@ export class HeliosUI {
         controls.className = 'helios-ui-row__controls';
         controls.appendChild(toggle);
         const { row } = createAlignedRow({
-          title: info.label ?? accessorName,
+          title: label,
           hint: info.description ?? null,
           controls,
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor(accessorName)),
+          dirtyIndicator: createStateIndicator(statePathForAccessor(accessorName)),
         });
         this._controlCleanups.add(() => unsub());
         return row;
@@ -2128,8 +3371,9 @@ export class HeliosUI {
         if (!info || info.type !== 'string') return null;
         if (typeof source?.[accessorName] !== 'function') return null;
         const attribute = bind(accessorName);
+        const label = attribute.label ?? info.label ?? humanizeControlLabel(accessorName);
         const select = createSelectControl({
-          ariaLabel: info.label ?? accessorName,
+          ariaLabel: label,
           options,
           value: attribute.value(),
         });
@@ -2151,10 +3395,10 @@ export class HeliosUI {
         controls.className = 'helios-ui-row__controls';
         controls.appendChild(select);
         const { row } = createAlignedRow({
-          title: info.label ?? accessorName,
+          title: label,
           hint: info.description ?? null,
           controls,
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor(accessorName)),
+          dirtyIndicator: createStateIndicator(statePathForAccessor(accessorName)),
         });
         this._controlCleanups.add(() => unsub());
         return row;
@@ -2171,6 +3415,22 @@ export class HeliosUI {
         const g = Math.round(255 * clamp01(rgba?.[1] ?? 0));
         const b = Math.round(255 * clamp01(rgba?.[2] ?? 0));
         return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+      };
+      const hexToRgba01 = (value) => {
+        const raw = String(value ?? '').trim().replace(/^#/, '');
+        if (!/^([0-9a-f]{6}|[0-9a-f]{8})$/i.test(raw)) return null;
+        const r = parseInt(raw.slice(0, 2), 16);
+        const g = parseInt(raw.slice(2, 4), 16);
+        const b = parseInt(raw.slice(4, 6), 16);
+        const a = raw.length === 8 ? parseInt(raw.slice(6, 8), 16) : 255;
+        if (![r, g, b, a].every(Number.isFinite)) return null;
+        return [r / 255, g / 255, b / 255, a / 255];
+      };
+      const applyBackgroundColor = (value) => {
+        const normalized = hexToRgba01(value) ?? value;
+        const target = appearanceBehavior?.background ?? this.helios?.background ?? this.helios?.clearColor;
+        if (typeof target === 'function') target.call(appearanceBehavior ?? this.helios, normalized);
+        writeAccessorPersistenceValue('background', normalized, 'background');
       };
 
       const createColorWithAlphaControls = ({ ariaLabel, getValue, setValue }) => {
@@ -2221,12 +3481,16 @@ export class HeliosUI {
 
         colorInput.value = baseHex;
         alphaInput.value = String(Number.isFinite(alpha) ? alpha : 1);
+        let lastCommittedValue = toHex8(colorInput.value, clamp01(alphaInput.value));
         swatch.style.background = colorInput.value;
 
         const commit = () => {
           const a = clampNumber(alphaInput.value, { min: 0, max: 1 });
           if (a == null) return;
-          setValue?.(toHex8(colorInput.value, a));
+          const nextValue = toHex8(colorInput.value, a);
+          if (nextValue === lastCommittedValue) return;
+          lastCommittedValue = nextValue;
+          setValue?.(nextValue);
           swatch.style.background = colorInput.value;
         };
 
@@ -2259,13 +3523,16 @@ export class HeliosUI {
         colorInput.className = 'helios-ui-color-swatch__input';
         colorInput.setAttribute('aria-label', ariaLabel);
 
+        colorInput.value = rgba01ToHex6(getValue?.());
+        let lastCommittedValue = toHex8(colorInput.value, 1);
+        swatch.style.background = colorInput.value;
         const commit = () => {
-          setValue?.(toHex8(colorInput.value, 1));
+          const nextValue = toHex8(colorInput.value, 1);
+          if (nextValue === lastCommittedValue) return;
+          lastCommittedValue = nextValue;
+          setValue?.(nextValue);
           swatch.style.background = colorInput.value;
         };
-
-        colorInput.value = rgba01ToHex6(getValue?.());
-        swatch.style.background = colorInput.value;
         colorInput.addEventListener('input', commit);
 
         swatchWrap.appendChild(swatch);
@@ -2379,6 +3646,45 @@ export class HeliosUI {
           : this.bindHeliosAccessor(accessorName, options)
       );
       const appearanceAccessorSource = appearanceBehavior ?? this.helios;
+      const registerAccessorPersistenceKey = (accessorName, read) => {
+        const path = statePathForAccessor(accessorName);
+        if (!path) return null;
+        this._registerStateKey(path, {
+          scope: stateScopeForPath(path),
+          debounceMs: stateDebounceForPath(path),
+          defaultValue: read?.(),
+          metadata: { accessor: accessorName },
+        });
+        return path;
+      };
+      const writeAccessorPersistenceValue = (accessorName, value, reason = accessorName) => {
+        const path = statePathForAccessor(accessorName);
+        if (!path) return null;
+        return this._writeStateValue(path, value, {
+          scope: stateScopeForPath(path),
+          source: 'ui',
+          reason,
+          debounceMs: stateDebounceForPath(path),
+          applyBinding: false,
+        });
+      };
+      const writeAppearanceAccessor = (accessorName, value, reason = accessorName) => {
+        const path = statePathForAccessor(accessorName);
+        const stateManager = this.helios?.states ?? null;
+        if (path && typeof stateManager?.entry === 'function' && typeof stateManager?.set === 'function' && stateManager.entry(path)) {
+          return this._writeStateValue(path, value, {
+            scope: stateScopeForPath(path),
+            source: 'ui',
+            reason,
+            debounceMs: stateDebounceForPath(path),
+            applyBinding: true,
+          });
+        }
+        const fallbackAccessorName = accessorName === 'background' ? 'clearColor' : accessorName;
+        const target = appearanceBehavior?.[accessorName] ?? this.helios?.[fallbackAccessorName];
+        if (typeof target === 'function') target.call(appearanceBehavior ?? this.helios, value);
+        return writeAccessorPersistenceValue(accessorName, value, reason);
+      };
 
       const createAppearanceContent = () => {
         const wrapper = document.createElement('div');
@@ -2391,11 +3697,27 @@ export class HeliosUI {
           ariaLabel: 'Scene dimension',
         });
         dimensionToggle.dataset.testid = 'controls-appearance-dimension';
+        const readSceneDimension = () => (
+          (this.helios?.mode?.() ?? this.helios?.options?.mode ?? '2d') === '3d' ? '3d' : '2d'
+        );
+        const defaultSceneDimension = this.helios?._initialMode === '3d' ? '3d' : '2d';
+        this._registerStateKey('scene.dimension', {
+          scope: 'network',
+          debounceMs: 0,
+          defaultValue: defaultSceneDimension,
+          metadata: { control: 'dimension' },
+        });
+        const unbindSceneDimension = this.helios?.states?.subscribe?.('scene.dimension', (value) => {
+            const nextMode = value === '3d' ? '3d' : '2d';
+            if (readSceneDimension() === nextMode) return;
+            this.helios?.setMode?.(nextMode);
+        });
+        if (typeof unbindSceneDimension === 'function') this._controlCleanups.add(unbindSceneDimension);
 
         const syncDimensionToggle = (mode = null) => {
           const nextMode = mode === '3d'
             ? '3d'
-            : (this.helios?.mode?.() ?? this.helios?.options?.mode ?? '2d') === '3d' ? '3d' : '2d';
+            : readSceneDimension();
           dimensionToggle.checked = nextMode === '3d';
           dimensionToggle.disabled = typeof this.helios?.setMode !== 'function';
         };
@@ -2403,6 +3725,19 @@ export class HeliosUI {
         dimensionToggle.addEventListener('change', () => {
           const targetMode = dimensionToggle.checked ? '3d' : '2d';
           Promise.resolve(this.helios?.setMode?.(targetMode))
+            .then(() => {
+              const currentMode = readSceneDimension();
+              if (currentMode !== targetMode) {
+                syncDimensionToggle(currentMode);
+                return;
+              }
+              this._writeStateValue('scene.dimension', currentMode, {
+                scope: 'network',
+                source: 'ui',
+                reason: 'dimension',
+                debounceMs: 0,
+              });
+            })
             .catch((error) => {
               // eslint-disable-next-line no-console
               console.error(error);
@@ -2421,11 +3756,12 @@ export class HeliosUI {
         if (unsubscribeMode) this._controlCleanups.add(unsubscribeMode);
         syncDimensionToggle();
 
+        registerAccessorPersistenceKey('background', () => appearanceBehavior?.background?.() ?? this.helios?.clearColor?.());
         wrapper.appendChild(createAlignedRow({
           title: 'Dimension',
           hint: 'Switch camera and active layout between 2D and 3D.',
           controls: dimensionToggle,
-          dirtyIndicator: createPersistenceIndicator('camera.mode', 'camera'),
+          dirtyIndicator: createStateIndicator('scene.dimension', 'scene'),
         }).row);
 
         wrapper.appendChild(createAlignedRow({
@@ -2434,9 +3770,9 @@ export class HeliosUI {
           controls: createColorWithAlphaControls({
             ariaLabel: 'Background color',
             getValue: () => appearanceBehavior?.background?.() ?? this.helios?.clearColor?.(),
-            setValue: (value) => appearanceBehavior?.background?.(value) ?? this.helios?.clearColor?.(value),
+            setValue: applyBackgroundColor,
           }),
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('background')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('background')),
         }).row);
 
         const modes = [
@@ -2471,7 +3807,7 @@ export class HeliosUI {
           title: 'Blend Mode',
           hint: 'Controls how overlapping edges are composited ("Smooth" reduces overlap artifacts).',
           controls: modeSelect,
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('edgeTransparencyMode')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('edgeTransparencyMode')),
         }).row);
 
         return wrapper;
@@ -2508,6 +3844,7 @@ export class HeliosUI {
           title: 'Labels',
           hint: 'Off hides regular labels. Auto Labels ranks visible labels. Selected Only limits regular labels to selected nodes.',
           controls: labelsModeSelect,
+          dirtyIndicator: createStateIndicator('labels.mode', 'labels'),
         }).row);
 
         const selectedOnlySpaceAwareToggle = createToggleControl({
@@ -2531,6 +3868,7 @@ export class HeliosUI {
         const selectedOnlySpaceAwareRow = createAlignedRow({
           title: 'Use Available Space',
           hint: 'When Selected Only is active, apply the same collision and space-availability logic used by regular labels.',
+          dirtyIndicator: createStateIndicator('labels.selectedOnlySpaceAware', 'labels'),
           controls: (() => {
             const controls = document.createElement('div');
             controls.className = 'helios-ui-row__controls';
@@ -2567,6 +3905,7 @@ export class HeliosUI {
           title: 'Source',
           hint: 'Node attribute used for labels. Empty = auto fallback (Label, Name, id).',
           controls: labelSourceControl.element,
+          dirtyIndicator: createStateIndicator('labels.source', 'labels'),
         }).row);
         this._controlCleanups.add(() => labelSourceControl.destroy());
 
@@ -2574,11 +3913,13 @@ export class HeliosUI {
           title: 'Font Family',
           hint: 'CSS font-family used by SVG labels.',
           controls: createLabelFontFamilyInput(labelsBehavior),
+          dirtyIndicator: createStateIndicator('labels.fontFamily', 'labels'),
         }).row);
 
         wrapper.appendChild(createAlignedRow({
           title: 'Fill',
           hint: 'Label text color + alpha.',
+          dirtyIndicator: createStateIndicator('labels.fill', 'labels'),
           controls: createColorWithAlphaControls({
             ariaLabel: 'Label fill color',
             getValue: () => labelsBehavior?.fill?.() ?? this.helios?.labelFill?.(),
@@ -2589,6 +3930,7 @@ export class HeliosUI {
         wrapper.appendChild(createAlignedRow({
           title: 'Outline',
           hint: 'Label outline/halo color + alpha.',
+          dirtyIndicator: createStateIndicator('labels.outlineColor', 'labels'),
           controls: createColorWithAlphaControls({
             ariaLabel: 'Label outline color',
             getValue: () => labelsBehavior?.outlineColor?.() ?? this.helios?.labelOutlineColor?.(),
@@ -2641,7 +3983,7 @@ export class HeliosUI {
                 title: 'Supersampling',
                 hint: 'Adjust canvas backing resolution live. Auto matches the legacy default.',
                 controls: supersamplingSelect,
-                dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('supersampling')),
+                dirtyIndicator: createStateIndicator(statePathForAccessor('supersampling')),
               }).row);
         }
 
@@ -2663,6 +4005,10 @@ export class HeliosUI {
       const nodeEdgeStack = new PanelStack();
       const createShadedAppearanceContent = () => {
         const container = document.createElement('div');
+        registerAccessorPersistenceKey('shadedLightColor', () => appearanceBehavior?.shadedLightColor?.() ?? this.helios?.shadedLightColor?.());
+        registerAccessorPersistenceKey('shadedAmbientTopColor', () => appearanceBehavior?.shadedAmbientTopColor?.() ?? this.helios?.shadedAmbientTopColor?.());
+        registerAccessorPersistenceKey('shadedAmbientBottomColor', () => appearanceBehavior?.shadedAmbientBottomColor?.() ?? this.helios?.shadedAmbientBottomColor?.());
+        registerAccessorPersistenceKey('shadedSpecularColor', () => appearanceBehavior?.shadedSpecularColor?.() ?? this.helios?.shadedSpecularColor?.());
         const nodesRow = createToggleRow('shadedNodes', {
           source: appearanceAccessorSource,
           bind: bindAppearanceAccessor,
@@ -2684,7 +4030,7 @@ export class HeliosUI {
           title: 'Light Direction',
           hint: 'Drag the end marker to aim shaded lighting; edit X/Y/Z directly for precise values.',
           controls: lightDirectionControl.element,
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('shadedLightDirection')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('shadedLightDirection')),
         }).row);
         this._controlCleanups.add(() => lightDirectionControl.destroy());
         container.appendChild(createAlignedRow({
@@ -2693,9 +4039,11 @@ export class HeliosUI {
           controls: createColorControls({
             ariaLabel: 'Shaded light color',
             getValue: () => appearanceBehavior?.shadedLightColor?.() ?? this.helios?.shadedLightColor?.(),
-            setValue: (value) => appearanceBehavior?.shadedLightColor?.(value) ?? this.helios?.shadedLightColor?.(value),
+            setValue: (value) => {
+              writeAppearanceAccessor('shadedLightColor', value, 'shaded-light-color');
+            },
           }),
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('shadedLightColor')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('shadedLightColor')),
         }).row);
         container.appendChild(createRows(['shadedDiffuseStrength'], {
           source: appearanceAccessorSource,
@@ -2707,9 +4055,11 @@ export class HeliosUI {
           controls: createColorControls({
             ariaLabel: 'Shaded ambient top color',
             getValue: () => appearanceBehavior?.shadedAmbientTopColor?.() ?? this.helios?.shadedAmbientTopColor?.(),
-            setValue: (value) => appearanceBehavior?.shadedAmbientTopColor?.(value) ?? this.helios?.shadedAmbientTopColor?.(value),
+            setValue: (value) => {
+              writeAppearanceAccessor('shadedAmbientTopColor', value, 'shaded-ambient-top-color');
+            },
           }),
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('shadedAmbientTopColor')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('shadedAmbientTopColor')),
         }).row);
         container.appendChild(createAlignedRow({
           title: 'Ambient Bottom',
@@ -2717,9 +4067,11 @@ export class HeliosUI {
           controls: createColorControls({
             ariaLabel: 'Shaded ambient bottom color',
             getValue: () => appearanceBehavior?.shadedAmbientBottomColor?.() ?? this.helios?.shadedAmbientBottomColor?.(),
-            setValue: (value) => appearanceBehavior?.shadedAmbientBottomColor?.(value) ?? this.helios?.shadedAmbientBottomColor?.(value),
+            setValue: (value) => {
+              writeAppearanceAccessor('shadedAmbientBottomColor', value, 'shaded-ambient-bottom-color');
+            },
           }),
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('shadedAmbientBottomColor')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('shadedAmbientBottomColor')),
         }).row);
         container.appendChild(createRows(['shadedAmbientStrength'], {
           source: appearanceAccessorSource,
@@ -2731,9 +4083,11 @@ export class HeliosUI {
           controls: createColorControls({
             ariaLabel: 'Shaded specular color',
             getValue: () => appearanceBehavior?.shadedSpecularColor?.() ?? this.helios?.shadedSpecularColor?.(),
-            setValue: (value) => appearanceBehavior?.shadedSpecularColor?.(value) ?? this.helios?.shadedSpecularColor?.(value),
+            setValue: (value) => {
+              writeAppearanceAccessor('shadedSpecularColor', value, 'shaded-specular-color');
+            },
           }),
-          dirtyIndicator: createPersistenceIndicator(persistencePathForAccessor('shadedSpecularColor')),
+          dirtyIndicator: createStateIndicator(statePathForAccessor('shadedSpecularColor')),
         }).row);
         container.appendChild(createRows(['shadedSpecularStrength', 'shadedShininess'], {
           source: appearanceAccessorSource,
@@ -2890,7 +4244,7 @@ export class HeliosUI {
         title: 'Shaded',
         collapsed: true,
         statusDot: false,
-        headerControls: createHeaderControlsWithIndicator(shadedToggle, persistencePathForAccessor('shadedEnabled')),
+        headerControls: createHeaderControlsWithIndicator(shadedToggle, statePathForAccessor('shadedEnabled')),
         content: createShadedAppearanceContent(),
       });
       if (supportsAmbientOcclusion) {
@@ -2899,7 +4253,7 @@ export class HeliosUI {
           title: 'Ambient Occlusion',
           collapsed: true,
           statusDot: false,
-          headerControls: createHeaderControlsWithIndicator(ambientOcclusionToggle, persistencePathForAccessor('ambientOcclusionEnabled')),
+          headerControls: createHeaderControlsWithIndicator(ambientOcclusionToggle, statePathForAccessor('ambientOcclusionEnabled')),
           content: createAmbientOcclusionContent(),
         });
       }
@@ -2912,9 +4266,21 @@ export class HeliosUI {
       const sceneTabs = new TabbedPanel({
         variant: 'panel',
         tabs: [
-          { id: 'appearance', title: 'Appearance', content: appearanceTab },
-          { id: 'labels', title: 'Labels', content: createLabelsContent() },
-          { id: 'advanced', title: 'Advanced', content: createAdvancedContent() },
+          {
+            id: 'appearance',
+            title: 'Appearance',
+            content: appearanceTab,
+          },
+          {
+            id: 'labels',
+            title: 'Labels',
+            content: createLabelsContent(),
+          },
+          {
+            id: 'advanced',
+            title: 'Advanced',
+            content: createAdvancedContent(),
+          },
         ],
       });
       content.appendChild(sceneTabs.element);
@@ -2936,6 +4302,7 @@ export class HeliosUI {
         title: options.title ?? 'Scene',
         position: options.position ?? { x: 16, y: 220 },
         dock: options.dock ?? 'top-left',
+        panelSchema: SCENE_PANEL_SCHEMA,
         content,
       });
 
@@ -2957,6 +4324,14 @@ export class HeliosUI {
     });
   }
 
+  /**
+   * Create the graph filtering panel with node and edge rule editors.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement, throttling, width, and initial filter options.
+   * @returns {Panel} Created panel instance.
+   */
   createFilterPanel(options = {}) {
     const content = document.createElement('div');
     content.className = 'helios-ui-filter';
@@ -3082,8 +4457,16 @@ export class HeliosUI {
         syncTabBarFilterForActiveTab(tabId);
       },
       tabs: [
-        { id: 'nodes', title: 'Nodes', content: nodeEditor.element },
-        { id: 'edges', title: 'Edges', content: edgeEditor.element },
+        {
+          id: 'nodes',
+          title: 'Nodes',
+          content: nodeEditor.element,
+        },
+        {
+          id: 'edges',
+          title: 'Edges',
+          content: edgeEditor.element,
+        },
       ],
     });
     this._controlCleanups.add(() => tabs.destroy());
@@ -3201,9 +4584,18 @@ export class HeliosUI {
       dock: options.dock ?? 'top-left',
       width: options.width,
       minWidth: options.minWidth,
+      panelSchema: FILTERS_PANEL_SCHEMA,
       content,
     });
   }
+  /**
+   * Create a metrics panel for basic graph and renderer counters.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and collapsed-state options.
+   * @returns {Panel} Created panel instance.
+   */
   createMetricsPanel(options = {}) {
     const content = document.createElement('div');
     content.style.setProperty('--helios-ui-label-col', '130px');
@@ -3622,6 +5014,30 @@ export class HeliosUI {
       return Boolean(writeBuffer());
     };
 
+    const markMetricOutputDirty = (metricName, attributes = []) => {
+      const names = Array.from(new Set((Array.isArray(attributes) ? attributes : [attributes])
+        .map((name) => String(name ?? '').trim())
+        .filter(Boolean)));
+      if (!names.length) return;
+      this.registerStateControl?.('metrics.lastOutput', {
+        scope: 'network',
+        debounceMs: 500,
+        defaultValue: null,
+        metadata: { panel: 'metrics' },
+      });
+      this.writeStateControl?.('metrics.lastOutput', {
+        metric: String(metricName ?? 'metric'),
+        attributes: names,
+        updatedAt: Date.now(),
+      }, {
+        scope: 'network',
+        source: 'ui',
+        reason: `metrics:${metricName ?? 'metric'}`,
+        debounceMs: 500,
+      });
+      this.helios?.storage?.markNetworkDirty?.(`metrics:${metricName ?? 'metric'}`);
+    };
+
     const styleStatusHint = (el) => {
       if (!el) return;
       el.className = 'helios-ui-label__hint';
@@ -3642,7 +5058,9 @@ export class HeliosUI {
       if (typeof globalThis !== 'undefined' && typeof globalThis.reportError === 'function') {
         try {
           globalThis.reportError(err);
-        } catch {}
+        } catch (reportErrorFailure) {
+          console.warn('[HeliosUI] reportError failed while reporting a metric error.', reportErrorFailure);
+        }
       }
       // eslint-disable-next-line no-console
       console.error(`[HeliosUI] ${metricName} failed`, { error: err, context });
@@ -4095,10 +5513,10 @@ export class HeliosUI {
     const betweenness = document.createElement('div');
 
     const betweennessWeightSelect = createEdgeWeightSelect('metrics-betweenness-weight', options?.betweenness?.edgeWeightAttribute ?? '');
-    const betweennessNormalizeCheckbox = createSegmentedToggleControl({
+    const betweennessNormalizeCheckbox = createToggleControl({
       checked: options?.betweenness?.normalize !== false,
-      onLabel: 'Normalized',
-      offLabel: 'Raw',
+      onLabel: 'On',
+      offLabel: 'Off',
       ariaLabel: 'Normalize betweenness values',
     });
     betweennessNormalizeCheckbox.dataset.testid = 'metrics-betweenness-normalize';
@@ -4453,14 +5871,14 @@ export class HeliosUI {
     dimensionOutLevelsAttrInput.value = String(options?.dimension?.outNodeDimensionLevelsAttribute ?? '');
     dimensionOutLevelsAttrInput.dataset.testid = 'metrics-dimension-outLevelsAttr';
 
-    const dimensionSaveLevelsCheckbox = createSegmentedToggleControl({
+    const dimensionSaveLevelsCheckbox = createToggleControl({
       checked: Boolean(
         options?.dimension?.saveLevelsDistribution
         ?? options?.dimension?.saveNodeDimensionLevels
         ?? options?.dimension?.outNodeDimensionLevelsAttribute
       ),
-      onLabel: 'Write Levels',
-      offLabel: 'Skip Levels',
+      onLabel: 'On',
+      offLabel: 'Off',
       ariaLabel: 'Write levels distribution',
     });
     dimensionSaveLevelsCheckbox.dataset.testid = 'metrics-dimension-saveLevels';
@@ -4874,6 +6292,7 @@ export class HeliosUI {
 
     clusteringVariantSelect.addEventListener('change', refreshClusteringWeightControls);
 
+    const edgeWeightInfoWarnings = new Set();
     const refreshEdgeWeightOptions = () => {
       const network = net();
       const names = network && typeof network.getEdgeAttributeNames === 'function'
@@ -4885,7 +6304,12 @@ export class HeliosUI {
           try {
             const info = network.getEdgeAttributeInfo(name);
             if (info && isNumericEdgeWeightType(info.type)) numericNames.push(name);
-          } catch (_) {}
+          } catch (error) {
+            if (!edgeWeightInfoWarnings.has(name)) {
+              edgeWeightInfoWarnings.add(name);
+              console.warn(`[HeliosUI] Failed to inspect edge attribute "${name}" for clustering weight controls.`, error);
+            }
+          }
         }
       }
       const autoStrengthWeight = numericNames.includes('weight')
@@ -4979,6 +6403,7 @@ export class HeliosUI {
         degreeElapsedValue.textContent = `${Math.round(Math.max(0, ended - started))} ms`;
         setDegreeStatus(wrote ? `Done • wrote "${outNodeAttribute}"` : 'Done');
         setMetricSectionState('metrics-degree', 'success');
+        if (wrote) markMetricOutputDirty('degree', outNodeAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5024,6 +6449,7 @@ export class HeliosUI {
         strengthElapsedValue.textContent = `${Math.round(Math.max(0, ended - started))} ms`;
         setStrengthStatus(wrote ? `Done • wrote "${outNodeAttribute}"` : 'Done');
         setMetricSectionState('metrics-strength', 'success');
+        if (wrote) markMetricOutputDirty('strength', outNodeAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5074,6 +6500,7 @@ export class HeliosUI {
         clusteringElapsedValue.textContent = `${Math.round(Math.max(0, ended - started))} ms`;
         setClusteringStatus(wrote ? `Done • wrote "${outNodeAttribute}"` : 'Done');
         setMetricSectionState('metrics-clustering', 'success');
+        if (wrote) markMetricOutputDirty('local-clustering', outNodeAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5154,6 +6581,7 @@ export class HeliosUI {
         const writeMsg = wrote ? ` • wrote "${outNodeAttribute}"` : '';
         setEigenvectorStatus(`Done • ${converged} in ${iterations} iterations${writeMsg}`);
         setMetricSectionState('metrics-eigen', 'success');
+        if (wrote) markMetricOutputDirty('eigenvector-centrality', outNodeAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5242,6 +6670,7 @@ export class HeliosUI {
         const writeMsg = wrote ? ` • wrote "${outNodeAttribute}"` : '';
         setBetweennessStatus(`Done${writeMsg}`);
         setMetricSectionState('metrics-betweenness', 'success');
+        if (wrote) markMetricOutputDirty('betweenness-centrality', outNodeAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5332,6 +6761,7 @@ export class HeliosUI {
         modularityValue.textContent = formatNumber(result?.modularity ?? NaN, 6);
         communityValue.textContent = String(result?.communityCount ?? '—');
         elapsedValue.textContent = `${Math.round(elapsedMs)} ms`;
+        markMetricOutputDirty('leiden-communities', outNodeCommunityAttribute);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5436,6 +6866,7 @@ export class HeliosUI {
         dimensionGlobalMaxValue.textContent = formatNumber(dmax, 4);
         dimensionSelectedCountValue.textContent = String(result?.selectedCount ?? '—');
         dimensionElapsedValue.textContent = `${Math.round(elapsedMs)} ms`;
+        if (writes.length) markMetricOutputDirty('dimension', [outNodeMaxDimensionAttribute, outNodeDimensionLevelsAttribute]);
         refreshAll();
         this.helios?.requestRender?.();
       } catch (error) {
@@ -5451,7 +6882,11 @@ export class HeliosUI {
         }
       } finally {
         if (session && typeof session.dispose === 'function') {
-          session.dispose();
+          try {
+            session.dispose();
+          } catch (error) {
+            warnUiDerivationFailure('Dimension metric session disposal failed', { error });
+          }
         }
         dimensionAbortController = null;
         setDimensionRunning(false);
@@ -5636,17 +7071,106 @@ export class HeliosUI {
       title: options.title ?? 'Metrics',
       position: options.position ?? { x: 16, y: 340 },
       dock: options.dock ?? 'top-left',
+      collapsed: options.collapsed ?? true,
       content,
     });
   }
 
+  /**
+   * Create a debug panel for persistence and state-manager counters.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and refresh-window options.
+   * @returns {Panel} Created panel instance.
+   */
+  createDebugPanel(options = {}) {
+    const content = document.createElement('div');
+    content.className = 'helios-ui-debug-panel';
+    const windowMs = Number.isFinite(options.windowMs)
+      ? Math.max(1000, Number(options.windowMs))
+      : 5 * 60 * 1000;
+    const refreshMs = Number.isFinite(options.refreshMs)
+      ? Math.max(500, Number(options.refreshMs))
+      : 1500;
+
+    const rows = [
+      ['trackedStateCount', 'Tracked states'],
+      ['stateChangeCount', 'State changes'],
+      ['uiChangeCount', 'UI changes'],
+      ['persistenceChangeCount', 'Persistence changes'],
+    ].map(([key, label]) => {
+      const row = document.createElement('div');
+      row.className = 'helios-ui-debug-panel__row';
+      const labelEl = document.createElement('span');
+      labelEl.className = 'helios-ui-debug-panel__label';
+      labelEl.textContent = label;
+      const valueEl = document.createElement('span');
+      valueEl.className = 'helios-ui-debug-panel__value';
+      valueEl.textContent = '0';
+      row.append(labelEl, valueEl);
+      content.appendChild(row);
+      return { key, valueEl };
+    });
+
+    const meta = document.createElement('div');
+    meta.className = 'helios-ui-debug-panel__meta';
+    content.appendChild(meta);
+
+    const update = () => {
+      const stats = this.helios?.storage?.debugStats?.({ windowMs })
+        ?? this.helios?.states?.debugStats?.({ windowMs })
+        ?? {};
+      for (const row of rows) {
+        const value = Number(stats[row.key] ?? 0);
+        row.valueEl.textContent = Number.isFinite(value) ? String(value) : '0';
+      }
+      const minutes = Math.max(1, Math.round(windowMs / 60000));
+      const sessionId = stats.sessionId ? String(stats.sessionId) : 'none';
+      const networkStatus = stats.networkData?.status ? String(stats.networkData.status) : 'unknown';
+      meta.textContent = `${minutes} min window | ${networkStatus} | ${sessionId}`;
+    };
+    update();
+    const interval = window.setInterval(update, refreshMs);
+    this._controlCleanups.add(() => window.clearInterval(interval));
+    const unsubscribeState = this.helios?.states?.subscribe?.('', update, { immediate: false });
+    if (typeof unsubscribeState === 'function') this._controlCleanups.add(unsubscribeState);
+    if (typeof this.helios?.storage?.addEventListener === 'function') {
+      const onStorageChange = () => update();
+      this.helios.storage.addEventListener('change', onStorageChange);
+      this._controlCleanups.add(() => this.helios?.storage?.removeEventListener?.('change', onStorageChange));
+    }
+
+    return this.createPanel({
+      id: options.id ?? 'helios-ui-debug',
+      title: options.title ?? 'Debug',
+      position: options.position ?? { x: 16, y: 420 },
+      dock: options.dock ?? 'right',
+      width: options.width ?? 320,
+      minWidth: options.minWidth ?? 280,
+      persistencePath: false,
+      collapsed: options.collapsed ?? true,
+      content,
+    });
+  }
+
+  /**
+   * Dispose all UI controls, panels, listeners, timers, and container resources.
+   *
+   * @public
+   * @apiSection User Interface
+   * @returns {void}
+   */
   destroy() {
+    if (this._persistenceBaselineRefreshTimer != null) clearTimeout(this._persistenceBaselineRefreshTimer);
+    this._persistenceBaselineRefreshTimer = null;
     for (const cleanup of this._controlCleanups) cleanup();
     this._controlCleanups.clear();
     this._boundAttributesById.clear();
     this._heliosBindingUnsubscribe = null;
     this.helios?.overlayInsets?.({ top: 0, right: 0, bottom: 0, left: 0 });
     this.panelManager?.destroy();
+    if (this.helios?.ui === this) this.helios.ui = null;
     if (this.helios?.layers && typeof this.helios.layers.removeLayer === 'function') {
       this.helios.layers.removeLayer(this.layerName);
       return;
@@ -5654,6 +7178,14 @@ export class HeliosUI {
     this.container?.remove?.();
   }
 
+  /**
+   * Create the visual mapper configuration panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and mapper panel options.
+   * @returns {Panel} Created panel instance.
+   */
   createMappersPanel(options = {}) {
     return new MappersPanel(this, options).create();
 
@@ -5668,7 +7200,6 @@ export class HeliosUI {
       position: 'Position',
       width: 'Width',
       opacity: 'Opacity',
-      endpointPosition: 'Endpoint Position',
       endpointSize: 'Endpoint Size',
     };
 
@@ -5831,7 +7362,6 @@ export class HeliosUI {
         channel === 'width' ||
         channel === 'opacity' ||
         channel === 'endpointSize';
-      const isEdgeEndpointPosition = channel === 'endpointPosition';
 
       if (mapperType === 'colormap') {
         return dim === 1;
@@ -5855,9 +7385,6 @@ export class HeliosUI {
           if (isEdge && typeof name === 'string' && name.startsWith('@node.')) return false;
           if (isEdge) return dim === 4 || dim === 8;
           return dim === 3 || dim === 4;
-        }
-        if (isEdgeEndpointPosition) {
-          return isEdge && dim === 6;
         }
         if (isScalarChannel) {
           if (isEdge) return dim === 1 || dim === 2;
@@ -5883,7 +7410,7 @@ export class HeliosUI {
       if (scope === 'node') {
         out.push('color', 'size', 'outline', 'outlineColor', 'position');
       } else {
-        out.push('edgeColor', 'edgeWidth', 'edgeOpacity', 'edgeEndpointPosition', 'edgeEndpointSize');
+        out.push('edgeColor', 'edgeWidth', 'edgeOpacity', 'edgeEndpointSize');
       }
 
       for (const name of raw) {
@@ -5970,7 +7497,8 @@ export class HeliosUI {
           }
           if (min === max) return { min, max: min + 1 };
           return { min, max };
-        } catch (_) {
+        } catch (error) {
+          warnUiDerivationFailure('Scalar extent computation failed', { scope, rawName, error });
           return null;
         }
       };
@@ -7456,31 +8984,27 @@ export class HeliosUI {
           }).row);
 
           const advanced = document.createElement('div');
-          const divergentInput = createSegmentedToggleControl({
+          const divergentInput = createToggleControl({
             checked: Boolean(state.pending.divergent) && allowDivergent,
             disabled: !allowDivergent,
-            onLabel: 'Divergent',
-            offLabel: 'Sequential',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Use divergent colormap domain',
           });
 
-          const clampWrap = document.createElement('div');
-          clampWrap.style.display = 'inline-flex';
-          clampWrap.style.alignItems = 'center';
-          clampWrap.style.gap = '10px';
           const clampState = normalizeClampSetting(state.pending.clamp);
-          const clampMinInput = createSegmentedToggleControl({
+          const clampMinInput = createToggleControl({
             checked: clampState.min,
-            onLabel: 'Min Clamp',
-            offLabel: 'Min Free',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Clamp values below the colormap domain',
           });
-          const clampMaxInput = createSegmentedToggleControl({
+          const clampMaxInput = createToggleControl({
             checked: clampState.max,
-            onLabel: 'Max Clamp',
-            offLabel: 'Max Free',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Clamp values above the colormap domain',
           });
-
-          clampWrap.appendChild(clampMinInput);
-          clampWrap.appendChild(clampMaxInput);
 
           const alphaSeed = clampNumber(state.pending.alpha ?? 1, { min: 0, max: 1 }) ?? 1;
           const alphaControls = createSuggestedSliderControls({
@@ -7524,9 +9048,15 @@ export class HeliosUI {
           }).row);
 
           advanced.appendChild(createAlignedRowEl({
-            title: 'Clamp',
-            controls: clampWrap,
-            hint: 'Clamp values outside the domain to the nearest end of the colormap.',
+            title: 'Clamp Min',
+            controls: clampMinInput,
+            hint: 'Clamp values below the domain to the lowest colormap color.',
+          }).row);
+
+          advanced.appendChild(createAlignedRowEl({
+            title: 'Clamp Max',
+            controls: clampMaxInput,
+            hint: 'Clamp values above the domain to the highest colormap color.',
           }).row);
 
           advanced.appendChild(createAlignedRowEl({ title: 'Alpha', controls: alphaControls.element }).row);
@@ -7665,18 +9195,50 @@ export class HeliosUI {
     });
   }
 
+  /**
+   * Create the layout controls panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and layout panel options.
+   * @returns {Panel} Created panel instance.
+   */
   createLayoutPanel(options = {}) {
     return new LayoutPanel(this, options).create();
   }
 
+  /**
+   * Create the legends controls panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and legend panel options.
+   * @returns {Panel} Created panel instance.
+   */
   createLegendsPanel(options = {}) {
     return new LegendsPanel(this, options).create();
   }
 
+  /**
+   * Create the camera controls panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and camera panel options.
+   * @returns {Panel} Created panel instance.
+   */
   createCameraPanel(options = {}) {
     return new CameraPanel(this, options).create();
   }
 
+  /**
+   * Create the selection and hover controls panel.
+   *
+   * @public
+   * @apiSection User Interface
+   * @param {object} [options] - Panel placement and selection panel options.
+   * @returns {Panel} Created panel instance.
+   */
   createSelectionPanel(options = {}) {
     return new SelectionPanel(this, options).create();
   }

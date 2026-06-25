@@ -11,7 +11,7 @@ export type DensityInteractionFilter = 'auto' | 'off' | 'selected' | 'highlighte
 export type DockSide = 'left' | 'right';
 export type InterfaceMode = 'desktop' | 'compact' | 'fullscreen';
 export type PersistenceKind = 'preferences' | 'visualization' | 'session';
-export type PortableNetworkFormat = 'bxnet' | 'zxnet' | 'xnet' | string;
+export type PortableNetworkFormat = 'bxnet' | 'zxnet' | 'xnet' | 'gml' | string;
 export type ExportedStateFormat = 'object' | 'string' | 'blob';
 export type PortableNetworkOutputFormat = 'uint8array' | 'arraybuffer' | 'base64' | 'blob';
 
@@ -57,6 +57,20 @@ export type HeliosUIPanelName =
 export interface HeliosUIAutoOptions extends Record<string, unknown> {
   panels?: boolean | 'default' | 'all' | HeliosUIPanelName | HeliosUIPanelName[];
   panelOptions?: Record<string, Record<string, unknown>>;
+}
+
+export interface HeliosQuickControlsOptions extends Record<string, unknown> {
+  enabled?: boolean;
+  autoFit?: boolean;
+  fit?: boolean;
+  layout?: boolean;
+  zoom?: boolean;
+  reserveLegendSpace?: boolean;
+  theme?: string;
+  buttonSize?: number;
+  gap?: number;
+  margin?: number;
+  zoomFactor?: number;
 }
 
 export interface HeliosNetworkSource {
@@ -155,14 +169,43 @@ export interface HeliosVisualizationStatePayload {
   behaviorState: HeliosBehaviorSnapshot;
   cameraState: CameraPose | null;
   networkSource: HeliosNetworkSource;
+  storageState?: Record<string, unknown> | null;
 }
 
 export interface HeliosSessionRecord {
   id: string | null;
   createdAt: number | null;
   updatedAt: number | null;
+  workspaceId?: string | null;
+  nickname?: string | null;
   unfinished: boolean;
   status: string;
+  bytes?: number;
+}
+
+export interface HeliosSessionSummary {
+  id: string | null;
+  workspaceId: string | null;
+  nickname: string | null;
+  label: string;
+  createdAt: number | null;
+  updatedAt: number | null;
+  unfinished: boolean;
+  status: string;
+  bytes: number;
+  current: boolean;
+  networkSource: HeliosNetworkSource | null;
+  thumbnail?: HeliosSessionThumbnail | null;
+}
+
+export interface HeliosSessionThumbnail {
+  type: string;
+  encoding: 'data-url' | string;
+  width: number;
+  height: number;
+  byteLength: number;
+  dataUrl: string;
+  capturedAt?: number;
 }
 
 export interface HeliosSessionPayload {
@@ -176,22 +219,13 @@ export interface HeliosSessionPayload {
     format: string;
     data: unknown;
   };
+  thumbnail?: HeliosSessionThumbnail | null;
   visualizationState: PersistenceEnvelope<HeliosVisualizationStatePayload>;
 }
 
-export interface HeliosPersistenceServiceOptions {
-  helios?: Helios | null;
-  preferenceStore?: LocalStoragePreferenceStore;
-  sessionStore?: IndexedDBSessionStore;
-  preferences?: Record<string, unknown>;
-  sessions?: Record<string, unknown>;
-  defaults?: Partial<HeliosPreferencesState>;
-  idFactory?: () => string;
-  now?: () => number;
-}
-
-export interface HeliosPersistenceSaveSessionOptions {
+export interface HeliosStorageSaveSessionOptions {
   id?: string;
+  nickname?: string;
   createdAt?: number;
   updatedAt?: number;
   networkFormat?: PortableNetworkFormat;
@@ -202,19 +236,43 @@ export interface HeliosPersistenceSaveSessionOptions {
   uiState?: HeliosUIState;
   behaviorState?: HeliosBehaviorSnapshot;
   networkSource?: HeliosNetworkSource;
+  thumbnail?: HeliosSessionThumbnail | null | Record<string, unknown>;
+  captureThumbnail?: boolean;
   unfinished?: boolean;
   status?: string;
 }
 
-export interface HeliosPersistenceListSessionsOptions {
-  includeFinished?: boolean;
-  limit?: number;
+export interface HeliosStartNewSessionOptions {
+  id?: string;
+  nickname?: string;
+  name?: string;
+  label?: string;
+  flushPrevious?: boolean;
+  includePreviousNetwork?: boolean;
+  snapshotPreviousLayoutRuntime?: boolean;
+  replaceUrlSession?: boolean;
 }
 
-export interface HeliosPersistenceRestoreSessionOptions {
+export interface HeliosStorageListSessionsOptions {
+  includeFinished?: boolean;
+  limit?: number;
+  excludeCurrent?: boolean;
+  currentSessionId?: string;
+}
+
+export interface HeliosStorageRestoreSessionOptions {
   disposeOld?: boolean;
   recreateRenderer?: boolean;
   markFinished?: boolean;
+}
+
+export interface HeliosFileDropOptions {
+  enabled?: boolean;
+  target?: string | HTMLElement;
+  supportedFormats?: PortableNetworkFormat[];
+  replaceOptions?: Record<string, unknown>;
+  overlayTitle?: string;
+  overlaySubtitle?: string;
 }
 
 export interface HeliosInterfaceResumePrompt {
@@ -223,6 +281,7 @@ export interface HeliosInterfaceResumePrompt {
   status: string;
   updatedAt: number | null;
   networkSource: HeliosNetworkSource | null;
+  sessions?: HeliosSessionSummary[];
 }
 
 export interface HeliosInterfaceState {
@@ -633,12 +692,24 @@ export class AppearanceBehavior extends Behavior<AppearanceBehaviorOptions, Appe
 
 export interface MapperChannelConfig {
   type?: string;
+  serializable?: boolean;
+  unsupported?: boolean;
   attributes?: string | string[] | null;
   from?: string | string[] | null;
+  transformType?: string;
+  transformPower?: number;
   colormap?: string;
+  alpha?: number;
+  clamp?: boolean | { min?: boolean; max?: boolean };
+  divergent?: boolean;
+  endpoints?: string;
+  nodeAttribute?: string;
   domain?: number[];
-  range?: number[];
+  range?: unknown[];
   value?: unknown;
+  defaultValue?: unknown;
+  rules?: MapperChannelConfig[];
+  __ui?: Record<string, unknown> | null;
   meta?: Record<string, unknown> | null;
   [key: string]: unknown;
 }
@@ -658,12 +729,12 @@ export interface MappersBehaviorState {
   node: {
     mode: string | null;
     defaultId: string | null;
-    mappers: Record<string, { channels: Record<string, { type: string | null; meta: Record<string, unknown> | null }> }>;
+    mappers: Record<string, { channels: Record<string, MapperChannelConfig> }>;
   };
   edge: {
     mode: string | null;
     defaultId: string | null;
-    mappers: Record<string, { channels: Record<string, { type: string | null; meta: Record<string, unknown> | null }> }>;
+    mappers: Record<string, { channels: Record<string, MapperChannelConfig> }>;
   };
 }
 
@@ -787,8 +858,8 @@ export class InterfaceBehavior extends Behavior<InterfaceBehaviorOptions, Helios
   resumePrompt(): HeliosInterfaceResumePrompt | null;
   ensurePersistenceReady(): Promise<this>;
   restoreInterfaceState(snapshot?: Partial<HeliosInterfaceState>, options?: Record<string, unknown>): this;
-  resumeSession(options?: HeliosPersistenceRestoreSessionOptions & { markFinished?: boolean }): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  startFresh(options?: { deletePendingSession?: boolean }): Promise<this>;
+  resumeSession(options?: HeliosStorageRestoreSessionOptions & { markFinished?: boolean }): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
+  startFresh(options?: { markFinished?: boolean; deletePendingSession?: boolean; delete?: boolean }): Promise<boolean>;
 }
 
 export interface HeliosBuiltInBehaviorMap {
@@ -856,7 +927,7 @@ export class Helios extends EventTarget {
   static UI_BINDINGS: Readonly<Record<string, unknown>>;
   behavior: HeliosBehaviorNamespace;
   behaviors: BehaviorManager;
-  persistence: HeliosPersistenceService;
+  storage: HeliosStorageManager;
   network: HeliosNetwork | null;
   ui: HeliosUI | null;
   ready: Promise<this>;
@@ -876,6 +947,7 @@ export class Helios extends EventTarget {
   getAttachedVisualizationState(network?: HeliosNetwork | null, options?: AttachedVisualizationStateOptions): PersistenceEnvelope<HeliosVisualizationStatePayload> | null;
   attachVisualizationStateToNetwork(snapshot?: PersistenceEnvelope<HeliosVisualizationStatePayload> | null, options?: AttachedVisualizationStateOptions): this;
   clearAttachedVisualizationState(options?: AttachedVisualizationStateOptions): this;
+  saveNetwork(format?: PortableNetworkFormat, options?: { output?: PortableNetworkOutputFormat; saveOptions?: Record<string, unknown> }): Promise<Uint8Array | ArrayBuffer | string | Blob>;
   savePortableNetwork(format?: PortableNetworkFormat, options?: SavePortableNetworkOptions): Promise<Uint8Array | ArrayBuffer | string | Blob>;
   cameraPose(): CameraPose;
   cameraControls(): CameraControlsSnapshot;
@@ -904,12 +976,20 @@ export class Helios extends EventTarget {
   setHighlightConnectedEdges(value: boolean): this;
   mode(): HeliosMode;
   setMode(mode: HeliosMode, options?: Record<string, unknown>): Promise<this>;
-  loadNetwork(source: Blob | ArrayBuffer | Uint8Array | string, options?: Record<string, unknown>): Promise<unknown>;
+  loadNetwork(source: Blob | File | ArrayBuffer | Uint8Array | string, options?: Record<string, unknown>): Promise<unknown>;
 }
 
 export interface HeliosOptions extends Record<string, unknown> {
   container?: string | HTMLElement | null;
   canvas?: HTMLCanvasElement | null;
+  renderer?: 'auto' | 'webgpu' | 'webgl';
+  antialias?: boolean | number;
+  supersampling?: number | boolean | 'auto';
+  powerPreference?: 'high-performance' | 'low-power';
+  webglContextAttributes?: WebGLContextAttributes;
+  webgpuAdapterOptions?: GPURequestAdapterOptions;
+  webgpuDeviceDescriptor?: GPUDeviceDescriptor;
+  webgpuCanvasConfiguration?: Partial<GPUCanvasConfiguration>;
   hoverStyleFromHighlight?: boolean;
   highlightConnectedEdges?: boolean;
   hoverAffectsOtherElements?: boolean;
@@ -919,19 +999,32 @@ export interface HeliosOptions extends Record<string, unknown> {
   interactionRenderOrderSelectedConnectedEdges?: boolean;
   interactionRenderOrderHighlightedConnectedEdges?: boolean;
   mode?: HeliosMode;
+  networkName?: string | null;
+  networkSource?: Partial<HeliosNetworkSource> | null;
   autoCleanup?: boolean;
   disposeNetworkOnDestroy?: boolean;
   legends?: LegendsBehaviorOptions;
   labels?: LabelsBehaviorOptions;
   densityInteractionFilter?: DensityInteractionFilter;
+  quickControls?: boolean | HeliosQuickControlsOptions;
   ui?: boolean | HeliosUIAutoOptions;
   /**
    * Built-in behaviors attach by default. Pass an object to tune individual
    * behaviors, custom behavior instances to attach extra behavior, or `false`
    * to opt out of default behavior attachment.
-   */
+  */
   behaviors?: false | string | Behavior | Array<string | Behavior> | BehaviorConfigObject;
-  persistence?: Omit<HeliosPersistenceServiceOptions, 'helios'>;
+  storage?: false | true | HeliosStorageConfig | HeliosStorageManager;
+  session?: false | true | Record<string, unknown>;
+  workspaceId?: string;
+  networkPersistence?: Record<string, unknown>;
+  positionPersistence?: Record<string, unknown>;
+  sessionThumbnail?: boolean | Record<string, unknown>;
+  autosyncInteractionIdleMs?: number | false;
+  interactionIdleMs?: number | false;
+  fileDrop?: boolean | HeliosFileDropOptions;
+  networkFileDrop?: boolean | HeliosFileDropOptions;
+  dragAndDropNetwork?: boolean | HeliosFileDropOptions;
 }
 
 export const EVENTS: Readonly<{
@@ -1091,8 +1184,9 @@ export class LocalStoragePreferenceStore {
   read(): Promise<unknown>;
   write(value: unknown): Promise<unknown>;
   clear(): Promise<void>;
-  getUnfinishedSessionId(): Promise<string | null>;
-  setUnfinishedSessionId(id: string | null): Promise<string | null>;
+  unfinishedSessionKeyFor(workspaceId?: string | null): string;
+  getUnfinishedSessionId(workspaceId?: string | null): Promise<string | null>;
+  setUnfinishedSessionId(id: string | null, workspaceId?: string | null): Promise<string | null>;
 }
 
 export class IndexedDBSessionStore {
@@ -1106,25 +1200,165 @@ export class IndexedDBSessionStore {
 export function createMemoryStorage(): Storage;
 export function createMemoryIndexedDBFactory(): IDBFactory;
 
-export class HeliosPersistenceService {
-  helios: Helios | null;
-  preferences: HeliosPreferencesState;
-  constructor(options?: HeliosPersistenceServiceOptions);
-  loadPreferences(): Promise<HeliosPreferencesState>;
-  savePreferences(nextPreferences?: HeliosPreferencesState): Promise<HeliosPreferencesState>;
-  getPreferences(): HeliosPreferencesState;
-  updatePreferences(patch?: Partial<HeliosPreferencesState>): Promise<HeliosPreferencesState>;
-  exportVisualizationState(options?: ExportVisualizationStateOptions): PersistenceEnvelope<HeliosVisualizationStatePayload> | string | Blob;
-  importVisualizationState(source: PersistenceEnvelope<HeliosVisualizationStatePayload> | string, options?: Record<string, unknown>): Promise<PersistenceEnvelope<HeliosVisualizationStatePayload>>;
-  saveSession(options?: HeliosPersistenceSaveSessionOptions): Promise<PersistenceEnvelope<HeliosSessionPayload>>;
-  getSession(id: string): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  listSessions(options?: HeliosPersistenceListSessionsOptions): Promise<Array<PersistenceEnvelope<HeliosSessionPayload>>>;
-  getRestorableSession(): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  restoreSession(idOrEnvelope: string | PersistenceEnvelope<HeliosSessionPayload>, options?: HeliosPersistenceRestoreSessionOptions): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  restoreUnfinishedSession(options?: HeliosPersistenceRestoreSessionOptions): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  markSessionFinished(id: string): Promise<PersistenceEnvelope<HeliosSessionPayload> | null>;
-  deleteSession(id: string): Promise<boolean>;
+export type StorageStateScope = 'user' | 'workspace' | 'network' | 'session';
+
+export interface StateEntryUI {
+  label?: string;
+  controller?: string;
+  min?: number;
+  max?: number;
+  step?: number;
+  domain?: unknown;
+  options?: unknown;
+  debounceMs?: number;
+  throttleMs?: number;
+  transform?: unknown;
 }
+
+export interface StateEntryDescriptor<T = unknown> {
+  description?: string;
+  default?: T;
+  defaultValue?: T;
+  type?: 'number' | 'boolean' | 'string' | 'enum' | 'object' | 'array';
+  scope?: StorageStateScope;
+  persist?: boolean;
+  aliases?: string[];
+  ui?: StateEntryUI;
+  getter?: () => T;
+  get?: () => T;
+  setter?: (value: T, options?: Record<string, unknown>) => void;
+  set?: (value: T, options?: Record<string, unknown>) => void;
+  subscribe?: (callback: (value: T, detail?: Record<string, unknown>) => void) => (() => void) | void;
+  binder?: (context: Record<string, unknown>) => (() => void) | void;
+  serialize?: (value: T, options?: Record<string, unknown>) => unknown;
+  deserialize?: (value: unknown, options?: Record<string, unknown>) => T;
+  equals?: (a: T, b: T) => boolean;
+}
+
+export interface StorageManagerCapabilities {
+  persistent: boolean;
+  sessions: boolean;
+  network: boolean;
+  remote: boolean;
+}
+
+export interface HeliosStorageConfig extends Record<string, unknown> {
+  type?: 'dummy' | 'memory' | 'browser' | 'remote' | string;
+  kind?: string;
+  sessionId?: string;
+  id?: string;
+  workspaceId?: string;
+  persistNetwork?: boolean;
+  client?: Record<string, unknown>;
+}
+
+export class StateRegistry extends EventTarget {
+  constructor(options?: Record<string, unknown>);
+  register(owner: unknown, prefix: string, entries: Record<string, StateEntryDescriptor>): () => void;
+  register(prefix: string, entries: Record<string, StateEntryDescriptor>): () => void;
+  entry(key: string): StateEntryDescriptor | null;
+  get(key: string, fallback?: unknown): unknown;
+  set(key: string, value: unknown, options?: Record<string, unknown>): Record<string, unknown> | null;
+  reset(keyOrPrefix: string, options?: Record<string, unknown>): { reset: boolean; entries: Array<Record<string, unknown>> };
+  status(keyOrPrefix: string, options?: Record<string, unknown>): Record<string, unknown>;
+  subscribe(keyOrPrefix: string, callback: (value: unknown, detail?: Record<string, unknown>) => void, options?: Record<string, unknown>): () => void;
+  restore(overrides?: Record<string, unknown>, options?: Record<string, unknown>): string[];
+  serialize(): Record<string, unknown>;
+  getOverrides(options?: Record<string, unknown>): Record<string, unknown>;
+  overrideKeys(): string[];
+  preferredKey(key: string): string;
+}
+
+export class BindingController {
+  constructor(manager: HeliosStorageManager);
+  bind(key: string, entry: StateEntryDescriptor): () => void;
+  unbind(key: string): boolean;
+  destroy(): void;
+}
+
+export class SessionStore {
+  constructor(options?: Record<string, unknown>);
+  put(record: Record<string, unknown>): Promise<Record<string, unknown>>;
+  get(id: string): Promise<Record<string, unknown> | null>;
+  getAll(): Promise<Array<Record<string, unknown>>>;
+  delete(id: string): Promise<boolean>;
+}
+
+export class HeliosStorageManager extends EventTarget {
+  capabilities: StorageManagerCapabilities;
+  type: string;
+  sessionId: string | null;
+  ready: Promise<unknown>;
+  constructor(options?: Record<string, unknown>);
+  register(owner: unknown, prefix: string, entries: Record<string, StateEntryDescriptor>): () => void;
+  register(prefix: string, entries: Record<string, StateEntryDescriptor>): () => void;
+  entry(key: string): StateEntryDescriptor | null;
+  get(key: string, fallback?: unknown): unknown;
+  set(key: string, value: unknown, options?: Record<string, unknown>): Record<string, unknown> | null;
+  reset(keyOrPrefix: string, options?: Record<string, unknown>): { reset: boolean; entries: Array<Record<string, unknown>> };
+  setOverrideTrackingReady(ready?: boolean): boolean;
+  status(keyOrPrefix: string, options?: Record<string, unknown>): Record<string, unknown>;
+  keyStatus(keyOrPrefix: string, options?: Record<string, unknown>): Record<string, unknown>;
+  persistenceStatus(): Record<string, unknown>;
+  getDirtyState(): Record<string, unknown>;
+  configure(options?: Record<string, unknown>): Record<string, unknown>;
+  getPreferences(): HeliosPreferencesState;
+  loadPreferences(): Promise<HeliosPreferencesState>;
+  updatePreferences(patch?: Partial<HeliosPreferencesState>): Promise<HeliosPreferencesState>;
+  markNetworkDirty(reason?: string): Record<string, unknown>;
+  markPositionsDirty(reason?: string): Record<string, unknown>;
+  setSessionNickname(nickname?: string | null, id?: string | null): Promise<unknown>;
+  subscribe(keyOrPrefix: string, callback: (value: unknown, detail?: Record<string, unknown>) => void, options?: Record<string, unknown>): () => void;
+  serializeSnapshot(options?: Record<string, unknown>): Record<string, unknown>;
+  restoreSnapshot(snapshot?: Record<string, unknown>, options?: Record<string, unknown>): string[];
+  serializeSessionSnapshot(options?: Record<string, unknown>): Promise<Record<string, unknown>>;
+  deserializeSessionSnapshot(snapshot?: Record<string, unknown>): Record<string, unknown>;
+  captureSessionThumbnail(options?: Record<string, unknown>): Promise<HeliosSessionThumbnail | null>;
+  saveSessionSnapshot(options?: Record<string, unknown>): Promise<unknown>;
+  restoreSessionSnapshot(snapshot?: Record<string, unknown>, options?: Record<string, unknown>): Promise<unknown>;
+  getOverrides(options?: Record<string, unknown>): Record<string, unknown>;
+  overrideKeys(): string[];
+  preferredKey(key: string): string;
+  loadSession(sessionId?: string | null): Promise<unknown>;
+  configureSession(options?: Record<string, unknown>): unknown;
+  restoreActiveSession(options?: Record<string, unknown>): Promise<unknown>;
+  saveSession(options?: Record<string, unknown>): Promise<unknown>;
+  getSession(id: string): Promise<unknown | null>;
+  listSessions(options?: Record<string, unknown>): Promise<Array<unknown>>;
+  listSessionSummaries(options?: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  getResumeSessions(options?: Record<string, unknown>): Promise<Array<Record<string, unknown>>>;
+  getResumePrompt(options?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  startNewSession(options?: Record<string, unknown>): Promise<Record<string, unknown> | null>;
+  resumeSession(sessionId?: string | null, options?: Record<string, unknown>): Promise<unknown>;
+  restoreSession(sessionIdOrRecord?: string | Record<string, unknown> | null, options?: Record<string, unknown>): Promise<unknown>;
+  deleteSession(id: string): Promise<boolean>;
+  markSessionFinished(id?: string | null): Promise<unknown>;
+  restorePortableStateFromNetwork(options?: Record<string, unknown>): Promise<unknown>;
+  flush(options?: Record<string, unknown>): Promise<unknown>;
+  flushAutosync(options?: Record<string, unknown>): Promise<unknown>;
+  sync(options?: Record<string, unknown>): Promise<unknown>;
+  destroy(): void;
+}
+
+export class DummyStorageManager extends HeliosStorageManager {}
+export class BrowserStorageManager extends HeliosStorageManager {}
+export class RemoteStorageManager extends HeliosStorageManager {}
+export function createHeliosStorageManager(config?: false | true | HeliosStorageConfig | HeliosStorageManager, context?: Record<string, unknown>): HeliosStorageManager;
+export const SCENE_PANEL_SCHEMA: Record<string, unknown>;
+export const LABELS_PANEL_SCHEMA: Record<string, unknown>;
+export const LEGENDS_PANEL_SCHEMA: Record<string, unknown>;
+export const MAPPERS_PANEL_SCHEMA: Record<string, unknown>;
+export const FILTERS_PANEL_SCHEMA: Record<string, unknown>;
+export const LAYOUT_PANEL_SCHEMA: Record<string, unknown>;
+export const SELECTION_PANEL_SCHEMA: Record<string, unknown>;
+export function createPanelSchemaIndicator(options?: Record<string, unknown>): HTMLElement;
+export function humanizeControlLabel(value?: unknown): string;
+export function normalizePanelSchema(schema?: Record<string, unknown>): Record<string, unknown>;
+export function panelSchemaKeys(schema?: Record<string, unknown>): string[];
+export function panelSchemaSectionKeys(schema?: Record<string, unknown>, sectionId?: string): string[];
+export function panelSchemaSectionStatus(schema?: Record<string, unknown>, sectionId?: string, storage?: HeliosStorageManager | null): string;
+export function panelSchemaStatus(schema?: Record<string, unknown>, storage?: HeliosStorageManager | null): Record<string, unknown>;
+export function resolvePanelItemLabel(item?: unknown, storage?: HeliosStorageManager | null): string;
 
 export class HeliosUI {
   helios: Helios | null;

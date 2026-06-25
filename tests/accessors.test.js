@@ -172,6 +172,21 @@ test('density() exposes an explicit approximate log-ratio z-score toggle', () =>
 test('edge width scale UI binding exposes zero in the recommended slider range', () => {
   assert.equal(Helios.UI_BINDINGS.edgeWidthScale.domain.min, 0);
   assert.equal(Helios.UI_BINDINGS.edgeWidthScale.recommendedRange.min, 0);
+  assert.equal(Helios.UI_BINDINGS.edgeWidthScale.domain.max, 10);
+  assert.equal(Helios.UI_BINDINGS.edgeWidthScale.recommendedRange.max, 10);
+});
+
+test('node size scale UI binding exposes zero in the recommended slider range', () => {
+  assert.equal(Helios.UI_BINDINGS.nodeSizeScale.domain.min, 0);
+  assert.equal(Helios.UI_BINDINGS.nodeSizeScale.recommendedRange.min, 0);
+  assert.equal(Helios.UI_BINDINGS.nodeSizeScale.recommendedRange.max, 10);
+});
+
+test('outline width scale UI binding exposes the full suggested slider range', () => {
+  assert.equal(Helios.UI_BINDINGS.nodeOutlineWidthScale.domain.min, 0);
+  assert.equal(Helios.UI_BINDINGS.nodeOutlineWidthScale.domain.max, 20);
+  assert.equal(Helios.UI_BINDINGS.nodeOutlineWidthScale.recommendedRange.min, 0);
+  assert.equal(Helios.UI_BINDINGS.nodeOutlineWidthScale.recommendedRange.max, 20);
 });
 
 test('fast edge rendering UI binding is exposed as a boolean toggle', () => {
@@ -198,7 +213,7 @@ test('ambient occlusion UI bindings expose the intended defaults and slider rang
   assert.deepEqual(Helios.UI_BINDINGS.ambientOcclusionRadius.recommendedRange, { min: 4, max: 100 });
 });
 
-test('adaptive edge quality is enabled by default and exposes configurable thresholds', () => {
+test('adaptive edge quality is disabled by default and exposes configurable thresholds', () => {
   const bindingEvents = [];
   const helios = Object.create(Helios.prototype);
   helios.options = {};
@@ -222,7 +237,7 @@ test('adaptive edge quality is enabled by default and exposes configurable thres
   };
 
   const defaults = helios.edgeAdaptiveQuality();
-  assert.equal(defaults.enabled, true);
+  assert.equal(defaults.enabled, false);
   assert.equal(defaults.slowFrameThresholdMs, 66);
   assert.equal(defaults.averageWindowFrames, 12);
   assert.equal(defaults.slowFrameConsecutiveFrames, 12);
@@ -314,6 +329,13 @@ test('adaptive edge quality enters fast mode when the recent HQ average exceeds 
   assert.equal(helios.renderer.graphLayer.edgeAdaptiveFastRendering, true);
   assert.equal(helios._edgeAdaptiveRuntime.nextProbeAt, 2020);
   assert.equal(helios._edgeAdaptiveRuntime.reason, 'performance');
+});
+
+test('adaptive edge quality uses frame interval when GPU work outlives JS render submission', () => {
+  const helios = Object.create(Helios.prototype);
+  assert.equal(helios._resolveEdgeAdaptiveFrameCostMs(0.8, 180), 180);
+  assert.equal(helios._resolveEdgeAdaptiveFrameCostMs(24, 12), 24);
+  assert.equal(helios._resolveEdgeAdaptiveFrameCostMs(null, 75), 75);
 });
 
 test('adaptive edge quality stays in high quality when the recent HQ average stays below the threshold', () => {

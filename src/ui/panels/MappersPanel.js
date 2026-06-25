@@ -14,6 +14,7 @@ import { clampNumber } from '../utils/numbers.js';
 import { toHex8 } from '../utils/colors.js';
 import { isPublicAttributeName } from '../utils/attributes.js';
 import { shallowCloneChannelConfig } from '../utils/channelConfig.js';
+import { MAPPERS_PANEL_SCHEMA } from './panelSchema.js';
 
 const DIVERGING_D3_COLORMAPS = new Set([
   'interpolateBrBG',
@@ -127,9 +128,9 @@ function buildColormapCatalog() {
   return { entries, byGroup, byKey };
 }
 
-export function resolveCategoricalPaletteCatalogGroup(key, isScheme) {
-  if (key === 'category18') return 'Helios category';
-  return isScheme ? 'helios schemes' : 'helios ramps';
+export function resolveCategoricalPaletteCatalogGroup(source) {
+  const normalized = String(source ?? '').trim();
+  return normalized || 'other';
 }
 
 export function shouldShowCategoricalPaletteEntry(entry, preferScheme) {
@@ -144,28 +145,37 @@ export function resolveCategoricalDefaultPalette(entries = []) {
 
 function buildCategoricalPaletteCatalog() {
   const entries = [];
-  const pushEntry = ({ key, label, group, isScheme }) => {
+  const pushEntry = ({ key, label, source, isScheme }) => {
     if (!key) return;
-    entries.push({ key, label: String(label ?? key), group: String(group ?? 'other'), isScheme: Boolean(isScheme) });
+    const scheme = Boolean(isScheme);
+    const group = resolveCategoricalPaletteCatalogGroup(source);
+    entries.push({
+      key,
+      label: String(label ?? key),
+      group,
+      source: group,
+      isScheme: scheme,
+      kind: scheme ? 'scheme' : 'ramp',
+    });
   };
 
   for (const [key, desc] of Object.entries(colormaps?.d3 ?? {})) {
     const isScheme = Boolean(desc?.isScheme);
     const label = key.startsWith('scheme') ? key.slice('scheme'.length) : key;
-    pushEntry({ key, label, group: isScheme ? 'd3 schemes' : 'd3 ramps', isScheme });
+    pushEntry({ key, label, source: 'd3', isScheme });
   }
 
   for (const [key, desc] of Object.entries(colormaps?.cmasher ?? {})) {
     const isScheme = Boolean(desc?.isScheme);
     const label = key.startsWith('cmasher_') ? key.slice('cmasher_'.length) : key;
     const alias = key.startsWith('cmasher_') ? `cmasher:${label}` : key;
-    pushEntry({ key: alias, label, group: isScheme ? 'cmasher schemes' : 'cmasher ramps', isScheme });
+    pushEntry({ key: alias, label, source: 'cmasher', isScheme });
   }
 
   for (const [key, desc] of Object.entries(colormaps?.CET ?? {})) {
     const isScheme = Boolean(desc?.isScheme);
     const label = key.startsWith('CET_') ? key.slice('CET_'.length) : key;
-    pushEntry({ key, label, group: isScheme ? 'CET schemes' : 'CET ramps', isScheme });
+    pushEntry({ key, label, source: 'CET', isScheme });
   }
 
   for (const [key, desc] of Object.entries(colormaps?.helios ?? {})) {
@@ -173,7 +183,7 @@ function buildCategoricalPaletteCatalog() {
     pushEntry({
       key,
       label: key,
-      group: resolveCategoricalPaletteCatalogGroup(key, isScheme),
+      source: 'helios',
       isScheme,
     });
   }
@@ -369,7 +379,6 @@ export class MappersPanel {
       position: 'Position',
       width: 'Width',
       opacity: 'Opacity',
-      endpointPosition: 'Endpoint Position',
       endpointSize: 'Endpoint Size',
     };
 
@@ -545,7 +554,6 @@ export class MappersPanel {
         channel === 'width' ||
         channel === 'opacity' ||
         channel === 'endpointSize';
-      const isEdgeEndpointPosition = channel === 'endpointPosition';
 
       if (mapperType === 'colormap') {
         return dim === 1;
@@ -572,9 +580,6 @@ export class MappersPanel {
           if (isEdge && typeof name === 'string' && /^@nodes?\./.test(name)) return false;
           if (isEdge) return dim === 4 || dim === 8;
           return dim === 3 || dim === 4;
-        }
-        if (isEdgeEndpointPosition) {
-          return isEdge && dim === 6;
         }
         if (isScalarChannel) {
           if (isEdge) return dim === 1 || dim === 2;
@@ -636,6 +641,149 @@ export class MappersPanel {
         return unique.filter((name) => isCompatibleAttribute(scope, channel, mapperType, name, { targetMode }));
       }
       return unique;
+    };
+
+    const CONSTANT_SOURCE = '$constant';
+    const LAYOUT_SOURCE = '$layout';
+
+    const resolveSourceLabel = (name) => {
+      if (name === CONSTANT_SOURCE) return 'Fixed value';
+      if (name === LAYOUT_SOURCE) return 'Layout positions';
+      if (name === '$index') return 'Index';
+      if (typeof name === 'string' && name.startsWith('@node.')) return `Node: ${name.slice('@node.'.length)}`;
+      return name;
+    };
+
+    const resolveSourceGroupLabel = (name) => {
+      if (name === CONSTANT_SOURCE || name === LAYOUT_SOURCE || name === '$index') return 'Special sources';
+      if (typeof name === 'string' && name.startsWith('@node.')) return 'Node attributes';
+      return 'Attributes';
+    };
+
+    const appendGroupedSourceOptions = (select, sources) => {
+      const groups = new Map([
+        ['Special sources', []],
+        ['Attributes', []],
+        ['Node attributes', []],
+      ]);
+      for (const source of sources) {
+        const group = resolveSourceGroupLabel(source);
+        const list = groups.get(group) ?? [];
+        list.push(source);
+        groups.set(group, list);
+      }
+
+      for (const [label, values] of groups.entries()) {
+        if (!values.length) continue;
+        const optgroup = document.createElement('optgroup');
+        optgroup.label = label;
+        for (const source of values) {
+          const opt = document.createElement('option');
+          opt.value = source;
+          opt.textContent = resolveSourceLabel(source);
+          optgroup.appendChild(opt);
+        }
+        select.appendChild(optgroup);
+      }
+    };
+
+    const listMapperSources = (mode, channel) => {
+      const network = net();
+      const out = [CONSTANT_SOURCE];
+      if (mode === 'node' && channel === 'position') out.push(LAYOUT_SOURCE);
+
+      out.push(...listAttributeNames(mode, { channel }));
+
+      if (mode === 'edge' && typeof network?.getNodeAttributeNames === 'function') {
+        out.push('@node.color', '@node.size', '@node.outline', '@node.outlineColor', '@node.position');
+        let nodeRaw = [];
+        try {
+          nodeRaw = network.getNodeAttributeNames() ?? [];
+        } catch (_) {
+          nodeRaw = [];
+        }
+        for (const name of nodeRaw) {
+          if (typeof name !== 'string') continue;
+          if (!isPublicAttributeName(name)) continue;
+          out.push(`@node.${name}`);
+        }
+      }
+
+      const unique = Array.from(new Set(out));
+      unique.sort((a, b) => {
+        if (a === CONSTANT_SOURCE) return -1;
+        if (b === CONSTANT_SOURCE) return 1;
+        if (a === LAYOUT_SOURCE) return -1;
+        if (b === LAYOUT_SOURCE) return 1;
+        if (a === '$index') return -1;
+        if (b === '$index') return 1;
+        return a.localeCompare(b);
+      });
+      return unique;
+    };
+
+    const inferSourceFromConfig = (config) => {
+      if (!config) return null;
+      const type = config.type ?? config.mode ?? null;
+      if (type === 'constant') return CONSTANT_SOURCE;
+      if (type === 'layout') return LAYOUT_SOURCE;
+      if ((type === 'nodeAttribute' || type === 'nodeToEdge') && typeof config.nodeAttribute === 'string' && config.nodeAttribute.length) {
+        return `@node.${config.nodeAttribute}`;
+      }
+      const attrs = config.attributes ?? config.from;
+      if (typeof attrs === 'string' && attrs.length) return attrs;
+      if (Array.isArray(attrs)) {
+        const nodeAttr = attrs.find((value) => typeof value === 'string' && /^@nodes?\./.test(value));
+        if (nodeAttr) return nodeAttr.replace(/^@nodes?\./, '@node.');
+        const first = attrs.find((value) => typeof value === 'string' && value.length);
+        if (first) return first;
+      }
+      return null;
+    };
+
+    const normalizeNodeSourceName = (source) => {
+      if (typeof source !== 'string') return '';
+      if (source.startsWith('@node.')) return source.slice('@node.'.length);
+      if (source.startsWith('@nodes.')) return source.slice('@nodes.'.length);
+      return source;
+    };
+
+    const resolveAllowedTypesForSource = (mode, channel, source, channelTypes = []) => {
+      if (source === CONSTANT_SOURCE) return channelTypes.includes('constant') ? ['constant'] : [];
+      if (source === LAYOUT_SOURCE) return channelTypes.includes('layout') ? ['layout'] : [];
+      if (typeof source !== 'string' || !source.length) return [];
+
+      return channelTypes.filter((type) => {
+        if (type === 'constant' || type === 'layout') return false;
+        if (type === 'nodeAttribute') {
+          if (!source.startsWith('@node.')) return false;
+          return isCompatibleAttribute('node', channel, 'nodeAttribute', normalizeNodeSourceName(source), { targetMode: mode });
+        }
+        return isCompatibleAttribute(mode, channel, type, source);
+      });
+    };
+
+    const resolveBestTypeForSource = (mode, channel, source, allowedTypes = []) => {
+      if (!allowedTypes.length) return null;
+      if (source === CONSTANT_SOURCE) return allowedTypes[0];
+      if (source === LAYOUT_SOURCE) return allowedTypes[0];
+      if (source?.startsWith?.('@node.') && allowedTypes.includes('nodeAttribute')) return 'nodeAttribute';
+
+      const info = getAttributeInfo(mode, source);
+      const isColor = channel === 'color' || channel === 'outlineColor';
+      const isScalar =
+        channel === 'size' ||
+        channel === 'outline' ||
+        channel === 'width' ||
+        channel === 'opacity';
+
+      if (info && (isCategoricalAttributeType(info.type) || isStringAttributeType(info.type)) && allowedTypes.includes('categorical')) {
+        return 'categorical';
+      }
+      if (isColor && allowedTypes.includes('colormap')) return 'colormap';
+      if (isScalar && allowedTypes.includes('linear')) return 'linear';
+      if (allowedTypes.includes('passthrough')) return 'passthrough';
+      return allowedTypes[0];
     };
 
     const resolveCollection = (mode) => {
@@ -1257,8 +1405,8 @@ export class MappersPanel {
 	        for (const control of localControls) {
 	          try {
 	            control.destroy?.();
-	          } catch (_) {
-	            // ignore
+	          } catch (error) {
+	            console.warn('[HeliosUI][MappersPanel] Control cleanup failed.', error);
 	          }
 	        }
 	        localControls.clear();
@@ -1397,7 +1545,21 @@ export class MappersPanel {
           }
         }
 
-        const allowedTypes = resolveAllowedTypes(state.channel);
+        const channelAllowedTypes = resolveAllowedTypes(state.channel);
+        const sources = listMapperSources(mode, state.channel)
+          .filter((source) => resolveAllowedTypesForSource(mode, state.channel, source, channelAllowedTypes).length > 0);
+        const currentSourceCandidate = inferSourceFromConfig(state.pending) ?? inferSourceFromConfig(live);
+        let selectedSource = sources.includes(currentSourceCandidate)
+          ? currentSourceCandidate
+          : (currentSourceCandidate ?? CONSTANT_SOURCE);
+        if (!sources.includes(selectedSource)) sources.push(selectedSource);
+
+        const sourceSelect = document.createElement('select');
+        sourceSelect.className = 'helios-ui-select';
+        appendGroupedSourceOptions(sourceSelect, sources);
+        sourceSelect.value = selectedSource;
+
+        let allowedTypes = resolveAllowedTypesForSource(mode, state.channel, selectedSource, channelAllowedTypes);
         const customPresets = getCustomPresetMap(mode, state.channel);
 
         const resolveCurrentTypeKey = () => {
@@ -1422,13 +1584,21 @@ export class MappersPanel {
             if (id) return `custom:${id}`;
           }
 
-          return allowedTypes[0];
+          return resolveBestTypeForSource(mode, state.channel, selectedSource, allowedTypes) ?? allowedTypes[0];
         };
 
         const currentKey = resolveCurrentTypeKey();
 
         const typeSelect = document.createElement('select');
         typeSelect.className = 'helios-ui-select';
+
+        if (!allowedTypes.length && !customPresets.size) {
+          const opt = document.createElement('option');
+          opt.value = '';
+          opt.textContent = 'No compatible mapper';
+          typeSelect.appendChild(opt);
+          typeSelect.disabled = true;
+        }
 
         for (const t of allowedTypes) {
           const opt = document.createElement('option');
@@ -1449,26 +1619,34 @@ export class MappersPanel {
           ...allowedTypes,
           ...Array.from(customPresets.keys()).map((id) => `custom:${id}`),
         ];
-        typeSelect.value = availableKeys.includes(currentKey) ? currentKey : availableKeys[0];
+        typeSelect.value = availableKeys.includes(currentKey) ? currentKey : (availableKeys[0] ?? '');
 
-        const buildPendingForType = (nextType) => {
+        const buildPendingForType = (nextType, source = selectedSource) => {
           const prev = state.pending ?? {};
+          const prevSource = inferSourceFromConfig(prev);
+          const sourceChanged = Boolean(source && prevSource && source !== prevSource);
           const base = nextType === 'layout'
             ? { name: state.channel, type: nextType }
             : {
               name: state.channel,
               type: nextType,
-              attributes: prev.attributes ?? live?.attributes ?? live?.from,
               defaultValue: prev.defaultValue ?? live?.defaultValue,
             };
+          if (source && source !== CONSTANT_SOURCE && source !== LAYOUT_SOURCE) {
+            base.attributes = source;
+          } else {
+            base.attributes = prev.attributes ?? live?.attributes ?? live?.from;
+          }
           if (nextType === 'constant') {
             base.value = prev.value ?? live?.value;
             if (base.value == null && (state.channel === 'opacity' || state.channel === 'width')) {
               base.value = 1;
             }
+            delete base.attributes;
           }
           if (nextType === 'nodeAttribute') {
-            base.nodeAttribute = prev.nodeAttribute ?? live?.nodeAttribute ?? '';
+            const sourceNodeAttribute = normalizeNodeSourceName(source);
+            base.nodeAttribute = sourceNodeAttribute || prev.nodeAttribute || live?.nodeAttribute || '';
             base.endpoints = prev.endpoints ?? live?.endpoints ?? 'both';
             if (!base.nodeAttribute) {
               const isColorChannel = state.channel === 'color' || state.channel === 'outlineColor';
@@ -1478,10 +1656,10 @@ export class MappersPanel {
           }
           if (nextType === 'linear') {
             const attr = typeof base.attributes === 'string' ? base.attributes : null;
-            const prevDomain = isFiniteNumberPair(prev.domain) ? prev.domain : null;
-            const liveDomain = isFiniteNumberPair(live?.domain) ? live.domain : null;
-            const prevRange = isFiniteNumberPair(prev.range) ? prev.range : null;
-            const liveRange = isFiniteNumberPair(live?.range) ? live.range : null;
+            const prevDomain = !sourceChanged && isFiniteNumberPair(prev.domain) ? prev.domain : null;
+            const liveDomain = !sourceChanged && isFiniteNumberPair(live?.domain) ? live.domain : null;
+            const prevRange = !sourceChanged && isFiniteNumberPair(prev.range) ? prev.range : null;
+            const liveRange = !sourceChanged && isFiniteNumberPair(live?.range) ? live.range : null;
             base.transformType = prev.transformType ?? live?.transformType ?? 'linear';
             base.transformPower = prev.transformPower ?? live?.transformPower ?? 1;
             const hasDomain = Boolean(prevDomain || liveDomain);
@@ -1493,8 +1671,8 @@ export class MappersPanel {
           if (nextType === 'colormap') {
             base.colormap = prev.colormap ?? live?.colormap ?? 'interpolateInferno';
             const attr = typeof base.attributes === 'string' ? base.attributes : null;
-            const prevDomain = isFiniteNumberPair(prev.domain) ? prev.domain : null;
-            const liveDomain = isFiniteNumberPair(live?.domain) ? live.domain : null;
+            const prevDomain = !sourceChanged && isFiniteNumberPair(prev.domain) ? prev.domain : null;
+            const liveDomain = !sourceChanged && isFiniteNumberPair(live?.domain) ? live.domain : null;
             base.transformType = prev.transformType ?? live?.transformType ?? 'linear';
             base.transformPower = prev.transformPower ?? live?.transformPower ?? 1;
             const hasDomain = Boolean(prevDomain || liveDomain);
@@ -1507,12 +1685,12 @@ export class MappersPanel {
             base.attributes = typeof base.attributes === 'string'
               ? base.attributes
               : (typeof prev.attributes === 'string' ? prev.attributes : (typeof live?.attributes === 'string' ? live.attributes : ''));
-            base.domain = Array.isArray(prev.domain)
+            base.domain = !sourceChanged && Array.isArray(prev.domain)
               ? prev.domain
-              : (Array.isArray(live?.domain) ? live.domain : []);
-            base.range = Array.isArray(prev.range)
+              : (!sourceChanged && Array.isArray(live?.domain) ? live.domain : []);
+            base.range = !sourceChanged && Array.isArray(prev.range)
               ? prev.range
-              : (Array.isArray(live?.range) ? live.range : []);
+              : (!sourceChanged && Array.isArray(live?.range) ? live.range : []);
             base.defaultValue = prev.defaultValue ?? live?.defaultValue ?? '#888888ff';
             const meta = { ...(prev.meta && typeof prev.meta === 'object' ? prev.meta : null), ...(live?.meta && typeof live.meta === 'object' ? live.meta : null) };
             const nextMeta = meta && typeof meta === 'object' ? { ...meta } : {};
@@ -1529,11 +1707,28 @@ export class MappersPanel {
           return base;
         };
 
-        const setPendingType = (nextType) => {
-          state.pending = buildPendingForType(nextType);
+        const setPendingType = (nextType, source = selectedSource) => {
+          state.pending = buildPendingForType(nextType, source);
           setDirty(true);
           renderEditor();
         };
+
+        sourceSelect.addEventListener('change', () => {
+          selectedSource = sourceSelect.value;
+          pruneEphemeralCustomPresets(mode, state.channel);
+          const nextAllowed = resolveAllowedTypesForSource(mode, state.channel, selectedSource, channelAllowedTypes);
+          const nextType = resolveBestTypeForSource(mode, state.channel, selectedSource, nextAllowed);
+          if (nextType) {
+            setPendingType(nextType, selectedSource);
+          } else {
+            state.pending = {
+              name: state.channel,
+              attributes: selectedSource,
+            };
+            setDirty(true);
+            renderEditor();
+          }
+        });
 
         typeSelect.addEventListener('change', () => {
           const next = typeSelect.value;
@@ -1548,21 +1743,35 @@ export class MappersPanel {
             return;
           }
           pruneEphemeralCustomPresets(mode, state.channel);
-          setPendingType(next);
+          setPendingType(next, selectedSource);
         });
 
         editorBody.appendChild(createAlignedRow({
+          title: 'Attribute',
+          hint: 'Pick the attribute/source first; mapper type options are filtered to compatible choices.',
+          controls: sourceSelect,
+        }).row);
+
+        editorBody.appendChild(createAlignedRow({
           title: 'Type',
-          hint: 'Select how this channel is driven (constant, attribute passthrough, scale, colormap, layout).',
+          hint: 'Select the compatible mapper type for the chosen source.',
           controls: typeSelect,
         }).row);
 
         const pendingTypeKey = typeSelect.value;
         const pendingType = pendingTypeKey.startsWith('custom:') ? 'custom' : pendingTypeKey;
+        if (!pendingType) {
+          const note = document.createElement('div');
+          note.style.color = 'var(--helios-ui-muted)';
+          note.textContent = 'No compatible mapper is available for this attribute and channel.';
+          editorBody.appendChild(note);
+          syncApplyEnabled();
+          return;
+        }
         if (pendingType !== 'custom') {
           const rawType = state.pending?.type ?? state.pending?.mode ?? null;
           if (!rawType) {
-            state.pending = buildPendingForType(pendingType);
+            state.pending = buildPendingForType(pendingType, selectedSource);
           }
         }
         const isColor = state.channel === 'color' || state.channel === 'outlineColor';
@@ -1606,39 +1815,7 @@ export class MappersPanel {
           }).row);
         }
 
-        if (pendingType === 'passthrough') {
-          const attrSelect = document.createElement('select');
-          attrSelect.className = 'helios-ui-select';
-          const names = listAttributeNames(mode, { channel: state.channel, mapperType: 'passthrough' });
-          const current = typeof state.pending.attributes === 'string'
-            ? state.pending.attributes
-            : (typeof live?.attributes === 'string' ? live.attributes : '');
-          const optBlank = document.createElement('option');
-          optBlank.value = '';
-          optBlank.textContent = names.length ? 'Select attribute…' : 'No attributes';
-          attrSelect.appendChild(optBlank);
-          for (const name of names) {
-            const opt = document.createElement('option');
-            opt.value = name;
-            opt.textContent = name;
-            attrSelect.appendChild(opt);
-          }
-          attrSelect.value = names.includes(current) ? current : '';
-          attrSelect.addEventListener('change', () => {
-            state.pending = { ...state.pending, type: 'passthrough', attributes: attrSelect.value || undefined };
-            setDirty(true);
-          });
-          editorBody.appendChild(createAlignedRow({
-            title: 'Attribute',
-            hint: 'Pick the attribute used as input for this channel.',
-            controls: attrSelect,
-          }).row);
-        }
-
           if (pendingType === 'nodeAttribute') {
-            const attrSelect = document.createElement('select');
-            attrSelect.className = 'helios-ui-select';
-            const names = listAttributeNames('node', { channel: state.channel, mapperType: 'nodeAttribute', targetMode: mode });
             const fromAttributes = () => {
             const attrs = state.pending?.attributes ?? live?.attributes ?? live?.from ?? null;
             if (typeof attrs === 'string' && attrs.startsWith('@node.')) return attrs.slice('@node.'.length);
@@ -1653,47 +1830,17 @@ export class MappersPanel {
           };
           const current = typeof state.pending.nodeAttribute === 'string'
             ? state.pending.nodeAttribute
-            : (typeof live?.nodeAttribute === 'string' ? live.nodeAttribute : fromAttributes());
-
-          const optBlank = document.createElement('option');
-          optBlank.value = '';
-          optBlank.textContent = names.length ? 'Select node attribute…' : 'No node attributes';
-          attrSelect.appendChild(optBlank);
-
-          for (const name of names) {
-            const bare = name.startsWith('@node.') ? name.slice('@node.'.length) : name;
-            if (bare === '$index') continue;
-            const opt = document.createElement('option');
-            opt.value = bare;
-            opt.textContent = bare;
-            attrSelect.appendChild(opt);
-          }
-
-          attrSelect.value = current || '';
-          attrSelect.addEventListener('change', () => {
-            const bare = attrSelect.value || undefined;
+            : (typeof live?.nodeAttribute === 'string' ? live.nodeAttribute : (normalizeNodeSourceName(selectedSource) || fromAttributes()));
+          if (current && state.pending.nodeAttribute !== current) {
             state.pending = {
               ...state.pending,
               type: 'nodeAttribute',
-              nodeAttribute: bare,
+              nodeAttribute: current,
               endpoints: state.pending.endpoints ?? 'both',
-              attributes: bare ? [`@node.${bare}`] : undefined,
+              attributes: [`@node.${current}`],
             };
-            setDirty(true);
-          });
-            state._nodePassthroughUi = { attrSelect, endpointsSelect: state._nodePassthroughUi?.endpointsSelect ?? null };
-            registerControl({
-              destroy() {
-                if (state._nodePassthroughUi?.attrSelect === attrSelect) {
-                  state._nodePassthroughUi = null;
-                }
-              },
-            });
-            editorBody.appendChild(createAlignedRow({
-              title: 'Node Attribute',
-              hint: 'Pick the node attribute to propagate to edge endpoints.',
-              controls: attrSelect,
-            }).row);
+          }
+            state._nodePassthroughUi = { attrSelect: null, endpointsSelect: state._nodePassthroughUi?.endpointsSelect ?? null };
 
             if (mode === 'edge') {
               const endpointsSelect = document.createElement('select');
@@ -1714,7 +1861,7 @@ export class MappersPanel {
               const bare =
                 typeof state.pending.nodeAttribute === 'string' && state.pending.nodeAttribute.length
                   ? state.pending.nodeAttribute
-                  : (attrSelect.value || current || undefined);
+                  : (current || undefined);
               state.pending = {
                 ...state.pending,
                 type: 'nodeAttribute',
@@ -1731,12 +1878,12 @@ export class MappersPanel {
                     endpoints: endpointsSelect.value,
                   });
                 }
-              } catch (_) {
-                // ignore
+              } catch (error) {
+                console.warn('[HeliosUI][MappersPanel] Debug logging failed.', error);
               }
               setDirty(true);
             });
-              state._nodePassthroughUi = { attrSelect, endpointsSelect };
+              state._nodePassthroughUi = { attrSelect: null, endpointsSelect };
               registerControl({
                 destroy() {
                   if (state._nodePassthroughUi?.endpointsSelect === endpointsSelect) {
@@ -2090,44 +2237,6 @@ export class MappersPanel {
 
 	        if (pendingType === 'linear') {
 	          state.pending = normalizeRuleList(state.pending);
-	          const srcRow = document.createElement('div');
-	          srcRow.style.display = 'grid';
-	          srcRow.style.gap = '6px';
-
-          const attrSelect = document.createElement('select');
-          attrSelect.className = 'helios-ui-select';
-          const names = listAttributeNames(mode, { channel: state.channel, mapperType: 'linear' });
-          const current = typeof state.pending.attributes === 'string'
-            ? state.pending.attributes
-            : (typeof live?.attributes === 'string' ? live.attributes : '');
-          const optBlank = document.createElement('option');
-          optBlank.value = '';
-          optBlank.textContent = names.length ? 'Select attribute…' : 'No attributes';
-          attrSelect.appendChild(optBlank);
-          for (const name of names) {
-            const opt = document.createElement('option');
-            opt.value = name;
-            opt.textContent = name;
-            attrSelect.appendChild(opt);
-          }
-          attrSelect.value = names.includes(current) ? current : '';
-          attrSelect.addEventListener('change', () => {
-            const attr = attrSelect.value || undefined;
-            const domain = attr ? suggestDomainForAttribute(mode, attr) : [0, 1];
-            const range = isFiniteNumberPair(state.pending.range)
-              ? state.pending.range
-              : suggestRangeForChannel(mode, state.channel);
-            const nextPending = { ...state.pending, type: 'linear', attributes: attr, domain, range };
-            markDomainAuto(nextPending, true);
-            state.pending = nextPending;
-            setDirty(true);
-            renderEditor();
-          });
-          editorBody.appendChild(createAlignedRow({
-            title: 'Attribute',
-            hint: 'Pick the attribute to read values from.',
-            controls: attrSelect,
-          }).row);
 
           const transformWrap = document.createElement('div');
           transformWrap.style.display = 'flex';
@@ -2660,44 +2769,7 @@ export class MappersPanel {
 
             const { paletteName, preferScheme, sortOrder, maxCategories } = getCategoricalSettings();
 
-            const attrSelect = document.createElement('select');
-            attrSelect.className = 'helios-ui-select';
-            const names = listAttributeNames(mode, { channel: state.channel, mapperType: 'categorical' });
-            const current = typeof state.pending.attributes === 'string'
-              ? state.pending.attributes
-              : (typeof live?.attributes === 'string' ? live.attributes : '');
-            const optBlank = document.createElement('option');
-            optBlank.value = '';
-            optBlank.textContent = names.length ? 'Select attribute…' : 'No categorical attributes';
-            attrSelect.appendChild(optBlank);
-            for (const name of names) {
-              const opt = document.createElement('option');
-              opt.value = name;
-              opt.textContent = name;
-              attrSelect.appendChild(opt);
-            }
-            attrSelect.value = names.includes(current) ? current : '';
-            attrSelect.addEventListener('change', () => {
-              const attr = attrSelect.value || undefined;
-              const nextMeta = ensureCategoricalMeta();
-              state.pending = {
-                ...state.pending,
-                type: 'categorical',
-                attributes: attr,
-                domain: [],
-                range: [],
-                meta: nextMeta,
-              };
-              setDirty(true);
-              renderEditor();
-            });
-            editorBody.appendChild(createAlignedRow({
-              title: 'Attribute',
-              hint: 'Pick the categorical attribute to drive colors.',
-              controls: attrSelect,
-            }).row);
-
-            const attrName = attrSelect.value || '';
+            const attrName = typeof state.pending.attributes === 'string' ? state.pending.attributes : '';
             const attrInfo = attrName ? getAttributeInfo(mode, attrName) : null;
             if (!attrName) {
               const note = document.createElement('div');
@@ -2992,7 +3064,7 @@ export class MappersPanel {
               const paletteSearch = document.createElement('input');
               paletteSearch.type = 'text';
               paletteSearch.className = 'helios-ui-text helios-ui-colormap-popover__search';
-              paletteSearch.placeholder = 'Search palettes (e.g. tableau, scheme)…';
+              paletteSearch.placeholder = 'Search palettes…';
               paletteHeader.appendChild(paletteSearch);
               let palettePreferScheme = preferScheme;
               const paletteFilterBar = document.createElement('div');
@@ -3134,7 +3206,7 @@ export class MappersPanel {
                   return;
                 }
 
-                const groupOrder = ['d3 schemes', 'd3 ramps', 'cmasher schemes', 'cmasher ramps', 'CET schemes', 'CET ramps', 'Helios category', 'helios schemes', 'helios ramps', 'other'];
+                const groupOrder = ['d3', 'cmasher', 'CET', 'helios', 'other'];
                 const matchesByGroup = new Map();
                 for (const entry of matches) {
                   const list = matchesByGroup.get(entry.group) ?? [];
@@ -3174,6 +3246,9 @@ export class MappersPanel {
                     item.type = 'button';
                     item.className = 'helios-ui-colormap-picker__item';
                     item.dataset.key = entry.key;
+                    item.dataset.colormapSource = entry.source ?? entry.group ?? '';
+                    item.dataset.colormapKind = entry.kind ?? (entry.isScheme === true ? 'scheme' : 'ramp');
+                    item.dataset.colormapScheme = entry.isScheme === true ? 'true' : 'false';
 
                     const itemTitle = document.createElement('div');
                     itemTitle.className = 'helios-ui-colormap-picker__item-title helios-ui-ellipsis';
@@ -3412,8 +3487,8 @@ export class MappersPanel {
                   for (const cleanup of paletteCleanups.splice(0)) {
                     try {
                       cleanup();
-                    } catch (_) {
-                      // ignore
+                    } catch (error) {
+                      console.warn('[HeliosUI][MappersPanel] Palette cleanup failed.', error);
                     }
                   }
                 },
@@ -3781,37 +3856,6 @@ export class MappersPanel {
 
 	        if (pendingType === 'colormap') {
 	          state.pending = normalizeRuleList(state.pending);
-	          const attrSelect = document.createElement('select');
-	          attrSelect.className = 'helios-ui-select';
-	          const names = listAttributeNames(mode, { channel: state.channel, mapperType: 'colormap' });
-          const current = typeof state.pending.attributes === 'string'
-            ? state.pending.attributes
-            : (typeof live?.attributes === 'string' ? live.attributes : '');
-          const optBlank = document.createElement('option');
-          optBlank.value = '';
-          optBlank.textContent = names.length ? 'Select attribute…' : 'No attributes';
-          attrSelect.appendChild(optBlank);
-          for (const name of names) {
-            const opt = document.createElement('option');
-            opt.value = name;
-            opt.textContent = name;
-            attrSelect.appendChild(opt);
-          }
-          attrSelect.value = names.includes(current) ? current : '';
-          attrSelect.addEventListener('change', () => {
-            const attr = attrSelect.value || undefined;
-            const domain = attr ? suggestDomainForAttribute(mode, attr) : [0, 1];
-            const nextPending = { ...state.pending, type: 'colormap', attributes: attr, domain };
-            markDomainAuto(nextPending, true);
-            state.pending = nextPending;
-            setDirty(true);
-            renderEditor();
-          });
-          editorBody.appendChild(createAlignedRow({
-            title: 'Attribute',
-            hint: 'Pick the attribute to map through a colormap.',
-            controls: attrSelect,
-          }).row);
 
           const transformWrap = document.createElement('div');
           transformWrap.style.display = 'flex';
@@ -4035,31 +4079,27 @@ export class MappersPanel {
           }).row);
 
           const advanced = document.createElement('div');
-          const divergentInput = createSegmentedToggleControl({
+          const divergentInput = createToggleControl({
             checked: Boolean(state.pending.divergent) && allowDivergent,
             disabled: !allowDivergent,
-            onLabel: 'Divergent',
-            offLabel: 'Sequential',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Use divergent colormap domain',
           });
 
-          const clampWrap = document.createElement('div');
-          clampWrap.style.display = 'inline-flex';
-          clampWrap.style.alignItems = 'center';
-          clampWrap.style.gap = '10px';
           const clampState = normalizeClampSetting(state.pending.clamp);
-          const clampMinInput = createSegmentedToggleControl({
+          const clampMinInput = createToggleControl({
             checked: clampState.min,
-            onLabel: 'Min Clamp',
-            offLabel: 'Min Free',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Clamp values below the colormap domain',
           });
-          const clampMaxInput = createSegmentedToggleControl({
+          const clampMaxInput = createToggleControl({
             checked: clampState.max,
-            onLabel: 'Max Clamp',
-            offLabel: 'Max Free',
+            onLabel: 'On',
+            offLabel: 'Off',
+            ariaLabel: 'Clamp values above the colormap domain',
           });
-
-          clampWrap.appendChild(clampMinInput);
-          clampWrap.appendChild(clampMaxInput);
 
           const alphaSeed = clampNumber(state.pending.alpha ?? 1, { min: 0, max: 1 }) ?? 1;
           const alphaControls = new SuggestedSliderControls({
@@ -4106,9 +4146,14 @@ export class MappersPanel {
           }).row);
 
           advanced.appendChild(createAlignedRow({
-            title: 'Clamp',
-            hint: 'Clamp values outside the domain to the nearest end of the colormap.',
-            controls: clampWrap,
+            title: 'Clamp Min',
+            hint: 'Clamp values below the domain to the lowest colormap color.',
+            controls: clampMinInput,
+          }).row);
+          advanced.appendChild(createAlignedRow({
+            title: 'Clamp Max',
+            hint: 'Clamp values above the domain to the highest colormap color.',
+            controls: clampMaxInput,
           }).row);
 	          advanced.appendChild(createAlignedRow({
 	            title: 'Alpha',
@@ -4407,8 +4452,8 @@ export class MappersPanel {
               live: resolveLiveConfig(mode, state.channel),
             });
           }
-        } catch (_) {
-          // ignore
+        } catch (error) {
+          console.warn('[HeliosUI][MappersPanel] Debug logging failed before applying mapper config.', error);
         }
 
         if (mode === 'node' && state.channel === 'position') {
@@ -4432,8 +4477,8 @@ export class MappersPanel {
                 nodeToEdgeEdgeColor: entry ?? null,
               });
             }
-          } catch (_) {
-            // ignore
+          } catch (error) {
+            console.warn('[HeliosUI][MappersPanel] Debug logging failed after applying mapper config.', error);
           }
 
           // Ensure visuals update immediately even if the scheduler is currently idle.
@@ -4580,8 +4625,8 @@ export class MappersPanel {
         for (const control of localControls) {
           try {
             control.destroy?.();
-          } catch (_) {
-            // ignore
+          } catch (error) {
+            console.warn('[HeliosUI][MappersPanel] Density control cleanup failed.', error);
           }
         }
         localControls.clear();
@@ -4614,7 +4659,8 @@ export class MappersPanel {
         let raw = [];
         try {
           raw = network.getNodeAttributeNames() ?? [];
-        } catch (_) {
+        } catch (error) {
+          console.warn('[HeliosUI][MappersPanel] Failed to list node attributes for density controls.', error);
           raw = [];
         }
         for (const name of raw) {
@@ -4623,7 +4669,8 @@ export class MappersPanel {
           let info = null;
           try {
             info = network.getNodeAttributeInfo?.(name) ?? null;
-          } catch (_) {
+          } catch (error) {
+            console.warn(`[HeliosUI][MappersPanel] Failed to inspect node attribute "${name}" for density controls.`, error);
             info = null;
           }
           if (!info || (info.dimension ?? 1) !== 1) continue;
@@ -4755,8 +4802,8 @@ export class MappersPanel {
         if (!manualBackgroundColor) return;
         try {
           helios.clearColor?.(manualBackgroundColor);
-        } catch (_) {
-          // ignore invalid background restoration
+        } catch (error) {
+          console.warn('[HeliosUI][MappersPanel] Failed to restore density background color.', error);
         }
       };
 
@@ -4769,8 +4816,8 @@ export class MappersPanel {
         try {
           helios.clearColor?.(getDensityZeroColor(state));
           densityBackgroundApplied = true;
-        } catch (_) {
-          // ignore invalid background conversion
+        } catch (error) {
+          console.warn('[HeliosUI][MappersPanel] Failed to apply density background color.', error);
         }
       };
 
@@ -5264,11 +5311,20 @@ export class MappersPanel {
         syncChannelSelect();
       },
       tabs: [
-        { id: 'nodes', title: 'Nodes', content: nodeTab.root },
-        { id: 'edges', title: 'Edges', content: edgeTab.root },
+        {
+          id: 'nodes',
+          title: 'Nodes',
+          content: nodeTab.root,
+        },
+        {
+          id: 'edges',
+          title: 'Edges',
+          content: edgeTab.root,
+        },
         { id: 'density', title: 'Density', content: densityTab.root },
       ],
       variant: 'panel',
+      panelSchema: MAPPERS_PANEL_SCHEMA,
     });
   }
 }

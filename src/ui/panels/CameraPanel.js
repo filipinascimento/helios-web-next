@@ -161,12 +161,51 @@ export class CameraPanel {
         title: this.options.title ?? 'Camera',
         position: this.options.position ?? { x: 16, y: 760 },
         dock: this.options.dock ?? 'top-right',
+        collapsed: this.options.collapsed ?? true,
         content,
       });
     }
 
     const tooltipManager = createTooltipManager();
     const appendTopRow = createRowAppender(content, tooltipManager);
+    const persistCameraControl = (patch = {}) => {
+      const current = helios.cameraControls?.() ?? {};
+      for (const [key, value] of Object.entries(patch)) {
+        const path = `camera.controls.${key}`;
+        this.ui._registerStateKey?.(path, {
+          scope: 'network',
+          debounceMs: 500,
+          defaultValue: current[key],
+          metadata: { panel: 'camera', control: key },
+        });
+        this.ui._writeStateValue?.(path, value, {
+          scope: 'network',
+          source: 'ui',
+          reason: 'camera-control',
+          debounceMs: 500,
+        });
+      }
+    };
+    const shouldTrackCameraPoseOverride = (detail = null) => {
+      const origin = String(detail?.origin ?? detail?.change?.origin ?? '').trim();
+      return origin === 'ui' || origin === 'interaction' || origin === 'cli' || origin === 'program';
+    };
+    const persistCameraPose = (pose = helios.cameraPose?.() ?? null, options = {}) => {
+      if (!pose || typeof pose !== 'object') return;
+      this.ui._registerStateKey?.('camera.pose', {
+        scope: 'network',
+        debounceMs: 750,
+        defaultValue: pose,
+        metadata: { panel: 'camera' },
+      });
+      this.ui._writeStateValue?.('camera.pose', pose, {
+        scope: 'network',
+        source: 'ui',
+        reason: 'camera-pose',
+        debounceMs: 750,
+        trackOverride: options.trackOverride === true,
+      });
+    };
 
     const distanceControls = new SuggestedSliderControls({
       value: 1,
@@ -182,6 +221,7 @@ export class CameraPanel {
         } else {
           helios.setCameraPose({ zoom: numeric }, { source: 'ui' });
         }
+        persistCameraPose(null, { trackOverride: true });
       },
     });
     const distanceRow = appendTopRow({
@@ -198,10 +238,12 @@ export class CameraPanel {
       onLabel: 'On',
       offLabel: 'Off',
       ariaLabel: 'Auto fit',
-    });
-    autoFitToggle.addEventListener('change', () => {
-      helios.cameraControls?.({ autoFit: autoFitToggle.checked });
-    });
+      });
+      autoFitToggle.addEventListener('change', () => {
+        const patch = { autoFit: autoFitToggle.checked };
+        helios.cameraControls?.(patch);
+        persistCameraControl(patch);
+      });
     const autoFitBody = document.createElement('div');
     const appendAutoFitRow = createRowAppender(autoFitBody, tooltipManager);
 
@@ -210,13 +252,13 @@ export class CameraPanel {
       suggested: [AUTO_FIT_FREQUENCY_MIN, AUTO_FIT_FREQUENCY_MAX],
       step: 0.1,
       inputMin: AUTO_FIT_FREQUENCY_MIN,
-      inputMax: AUTO_FIT_FREQUENCY_MAX,
-      onCommit: (value) => {
-        helios.cameraControls?.({
-          autoFitIntervalMs: frequencyToIntervalMs(value),
-        });
-      },
-    });
+        inputMax: AUTO_FIT_FREQUENCY_MAX,
+        onCommit: (value) => {
+          const patch = { autoFitIntervalMs: frequencyToIntervalMs(value) };
+          helios.cameraControls?.(patch);
+          persistCameraControl(patch);
+        },
+      });
     appendAutoFitRow({
       title: 'Update Freq',
       hint: 'Higher values update auto-fit more often. Large networks still adapt downward automatically.',
@@ -261,10 +303,12 @@ export class CameraPanel {
       onLabel: 'On',
       offLabel: 'Off',
       ariaLabel: 'Camera animation',
-    });
-    animationToggle.addEventListener('change', () => {
-      helios.cameraControls?.({ animation: animationToggle.checked });
-    });
+      });
+      animationToggle.addEventListener('change', () => {
+        const patch = { animation: animationToggle.checked };
+        helios.cameraControls?.(patch);
+        persistCameraControl(patch);
+      });
     const animationBody = document.createElement('div');
     const appendAnimationRow = createRowAppender(animationBody, tooltipManager);
 
@@ -272,14 +316,14 @@ export class CameraPanel {
       value: 280,
       suggested: [0, 2000],
       step: 20,
-      inputMin: 0,
-      inputMax: 60000,
-      onCommit: (value) => {
-        helios.cameraControls?.({
-          animationDurationMs: clampNumber(value, 0, 60000, 280),
-        });
-      },
-    });
+        inputMin: 0,
+        inputMax: 60000,
+        onCommit: (value) => {
+          const patch = { animationDurationMs: clampNumber(value, 0, 60000, 520) };
+          helios.cameraControls?.(patch);
+          persistCameraControl(patch);
+        },
+      });
     appendAnimationRow({
       title: 'Duration',
       hint: 'Transition duration for fit and focus changes when animation is enabled.',
@@ -311,9 +355,9 @@ export class CameraPanel {
       inputMin: 0,
       inputMax: 10,
       onCommit: (value) => {
-        helios.cameraControls?.({
-          orbitSpeed: clampNumber(value, 0, 10, 0.08),
-        });
+        const patch = { orbitSpeed: clampNumber(value, 0, 10, 0.08) };
+        helios.cameraControls?.(patch);
+        persistCameraControl(patch);
       },
     });
     appendOrbitRow({
@@ -327,17 +371,23 @@ export class CameraPanel {
     let lastOrbitEnabled = false;
     const commitOrbitAxis = (basis = resolveCameraBasis(helios)) => {
       orbitAxisReferenceBasis = basis;
-      helios.cameraControls?.({ orbitAxis: orbitAxisViewToWorld(helios, orbitAxisView, basis) });
+      const patch = { orbitAxis: orbitAxisViewToWorld(helios, orbitAxisView, basis) };
+      helios.cameraControls?.(patch);
+      persistCameraControl(patch);
     };
     orbitToggle.addEventListener('change', () => {
       if (orbitToggle.checked) {
         orbitAxisReferenceBasis = resolveCameraBasis(helios);
-        helios.cameraControls?.({
+        const patch = {
           orbit: true,
           orbitAxis: orbitAxisViewToWorld(helios, orbitAxisView, orbitAxisReferenceBasis),
-        });
+        };
+        helios.cameraControls?.(patch);
+        persistCameraControl(patch);
       } else {
-        helios.cameraControls?.({ orbit: false });
+        const patch = { orbit: false };
+        helios.cameraControls?.(patch);
+        persistCameraControl(patch);
       }
     });
     const orbitAxisAttribute = {
@@ -366,11 +416,13 @@ export class CameraPanel {
       options: [
         { value: 'cw', label: 'Clockwise' },
         { value: 'ccw', label: 'Counter' },
-      ],
-      onChange: (value) => {
-        helios.cameraControls?.({ orbitDirection: value === 'ccw' ? -1 : 1 });
-      },
-    });
+        ],
+        onChange: (value) => {
+          const patch = { orbitDirection: value === 'ccw' ? -1 : 1 };
+          helios.cameraControls?.(patch);
+          persistCameraControl(patch);
+        },
+      });
     appendOrbitRow({
       title: 'Direction',
       hint: 'Orbit direction around the current target.',
@@ -413,12 +465,13 @@ export class CameraPanel {
       const state = detail?.state ?? null;
       const pose = state
         ? {
-            mode: state.mode,
-            distance: state.distance,
-            zoom: state.zoom,
-          }
+          mode: state.mode,
+          distance: state.distance,
+          zoom: state.zoom,
+        }
         : null;
       syncDistanceControl(pose);
+      persistCameraPose(null, { trackOverride: shouldTrackCameraPoseOverride(detail) });
     }, CAMERA_MOVE_SYNC_INTERVAL_MS);
 
     const sync = () => {
@@ -436,7 +489,7 @@ export class CameraPanel {
       intervalControls.set(intervalMsToFrequency(controls.autoFitIntervalMs ?? 900));
 
       animationToggle.checked = controls.animation === true;
-      durationControls.set(controls.animationDurationMs ?? 280);
+      durationControls.set(controls.animationDurationMs ?? 520);
 
       const orbitEnabled = controls.orbit === true;
       if (orbitEnabled && !lastOrbitEnabled) {
@@ -470,6 +523,7 @@ export class CameraPanel {
       title: this.options.title ?? 'Camera',
       position: this.options.position ?? { x: 16, y: 760 },
       dock: this.options.dock ?? 'top-right',
+      collapsed: this.options.collapsed ?? true,
       content,
     });
 

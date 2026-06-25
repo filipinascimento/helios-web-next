@@ -1,6 +1,6 @@
 # HeliosUI (Optional Interface System)
 
-HeliosUI is an optional, framework-agnostic HTML overlay for `helios-web-next`. It provides:
+HeliosUI is an optional, framework-agnostic HTML overlay for `helios-web`. It provides:
 
 - A panel manager (floating panels + docking)
 - A simple “tracked attribute” model for controls (`UIAttribute`)
@@ -13,7 +13,7 @@ The core renderer stays UI-free; HeliosUI is just another DOM layer on top of He
 
 ```js
 import HeliosNetwork from 'helios-network';
-import { Helios, HeliosUI } from 'helios-web-next';
+import { Helios, HeliosUI } from 'helios-web';
 
 const network = await HeliosNetwork.create();
 const helios = new Helios(network, { container: document.querySelector('#app') });
@@ -87,7 +87,24 @@ The Data panel now includes an `Attributes` tab with a live table of node, edge,
 
 Layout parameter bindings can describe how a control should be rendered. Numeric bindings may opt into `scale: 'log'` and `notation: 'scientific'`, which makes the Layout panel render a log slider with scientific-notation input while keeping the binding contract layout-agnostic.
 
+Storage-backed panel controls resolve display labels from panel item labels first,
+then storage `ui.label` metadata, then a humanized fallback. Internal accessor
+names such as `edgeAdaptiveQualitySlowFrameThresholdMs` are not shown directly
+in the Scene, Appearance, Labels, Legends, Mappers, Filters, Selection, or
+Layout controls. Complex panel markers use declarative schemas and stable
+storage prefixes, so mapper channel, filter rule, selected-item, selector-rule,
+and label-style restores mark the same panels as UI edits.
+
 The Mappers panel’s Density tab supports both the legacy `Difference` mode and the new `Log Ratio` mode. `Difference` preserves the existing normalized comparison path, while `Log Ratio` switches to a specialized dual-density comparison path with a real-valued numeric legend. In `Log Ratio` mode, the density panel exposes `Epsilon`, `Range`, `Z-score`, and `Support` controls and disables the legacy `Weight` / `Norm.` controls because those would break the interpretation of the numeric colorbar. `Z-score` switches the display from the raw log-ratio to a fast approximate local z-score derived from the same two density fields. `Support` enables or disables the automatic pooled-support correction that fades unstable sparse tails without changing the raw values in well-supported areas. The lower Density controls include `Focus`, which selects whether density uses auto focus, all active nodes, selected nodes, highlighted nodes, or selected-then-highlighted nodes. Density comparison colormap picking keeps the active search/filter state between openings, highlights the selected colormap, and includes a `Diverging` filter inside the picker.
+
+The Filter panel renders categorical attributes as compact checklist controls
+with per-category active-node counts, `All` and `None` actions, and a summary
+such as `All 12 selected` or `3 of 12 selected`. This matches the funding
+science project pattern while still keeping a hidden select bridge for existing
+rule collection and tests. Numeric ranges and raw query controls continue to use
+the shared debounced rule editor, so changing a categorical checklist does not
+force a network serialization; it only updates filter rules through the normal
+throttled filter path.
 
 Categorical node-color legend rows can be hovered to highlight matching nodes, clicked to keep a category highlighted, and Shift-clicked to add or remove categories from the persistent legend highlight. Set `legendClickAction: 'select'` to make clicks replace or extend the selection instead. Hovered rows show a gray outline; active categories keep a theme-aware gray outline without changing label size or style. Density defaults to `interactionFilter: 'auto'`, which focuses on selected nodes first, then real highlighted nodes, then all active nodes.
 
@@ -170,7 +187,7 @@ HeliosUI is built from plain DOM + CSS, but it now also exposes a small set of W
 ### Register elements
 
 ```js
-import { defineHeliosWebComponents } from 'helios-web-next';
+import { defineHeliosWebComponents } from 'helios-web';
 
 defineHeliosWebComponents(document);
 ```
@@ -189,7 +206,7 @@ This defines (at least) the custom element:
 Example:
 
 ```js
-import { defineHeliosWebComponents, ensureDefaultStyles } from 'helios-web-next';
+import { defineHeliosWebComponents, ensureDefaultStyles } from 'helios-web';
 
 defineHeliosWebComponents(document);
 ensureDefaultStyles(document);
@@ -236,7 +253,7 @@ const nodeSizeScale = ui.bindHeliosAccessor('nodeSizeScale', {
 Controllers are just DOM that read/write a `UIAttribute`. Here is a minimal checkbox row:
 
 ```js
-import { UIAttribute } from 'helios-web-next';
+import { UIAttribute } from 'helios-web';
 
 function createCheckboxRow(attribute, { title = attribute.label } = {}) {
   const row = document.createElement('div');
@@ -303,7 +320,7 @@ If you want to group multiple “sub-panels” inside a single panel, you can us
 ### Tabs
 
 ```js
-import { TabbedPanel } from 'helios-web-next';
+import { TabbedPanel } from 'helios-web';
 
 const tabs = new TabbedPanel({
   tabs: [
@@ -318,7 +335,7 @@ ui.createPanel({ id: 'controls', title: 'Controls', content: tabs.element });
 ### Stack (collapsible sections)
 
 ```js
-import { PanelStack } from 'helios-web-next';
+import { PanelStack } from 'helios-web';
 
 const stack = new PanelStack();
 stack.add({ id: 'globals', title: 'Globals', content: document.createElement('div') });

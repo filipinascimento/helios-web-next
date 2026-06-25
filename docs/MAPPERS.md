@@ -11,7 +11,7 @@ import {
   createColormapScale,
   colormaps,
   colormapToScheme,
-} from 'helios-web-next';
+} from 'helios-web';
 
 // Continuous values → RGBA via a perceptual colormap
 const nodeColor = createColormapScale(DEFAULT_NODE_COLORMAP, { domain: [0, 1], alpha: 1 });
@@ -43,13 +43,13 @@ Tips:
 
 If you’re using `HeliosUI`, the Mappers panel includes a searchable colormap picker with thumbnail previews to make it easier to browse ramps.
 
-Note: mapper configs that rely on arbitrary JavaScript functions (e.g. `.transform((v) => …)` or `.scale((v) => …)`) aren’t safely serializable. The UI focuses on declarative mappings (constant/passthrough/linear/colormap) plus “Default” and simple “Overrides” (rules like “-1 → gray”).
+Note: mapper configs that rely on arbitrary JavaScript functions (for example `.transform((v) => ...)` or `.scale((v) => ...)`) are not safely serializable. Persistence stores declarative mappings (`constant`, `passthrough`, `linear`, `categorical`, `colormap`, `nodeAttribute`, and `nodeToEdge`) plus built-in transforms through `transformType`/`transformPower`. Fully custom function channels are marked as unsupported in the serialized snapshot and restore to the existing/default channel instead of being replayed as a partial mapper.
 
 ## Categorical mapping
 
 Categorical channels map discrete attribute values to a fixed palette.
 
-`helios-web-next` also includes a built-in `category18` categorical palette for
+`helios-web` also includes a built-in `category18` categorical palette for
 community- or cluster-style labeling.
 
 ```js
@@ -78,6 +78,8 @@ mapper.setChannel('color', {
 
 In `HeliosUI`, the Mappers panel provides:
 
+- Source-first mapper editing: choose the attribute/source first, then choose from compatible mapper types for that source and visual channel.
+- A `Special sources` group for fixed values, generated indices, and layout positions without exposing internal source tokens.
 - Attribute selection for categorical fields (including string attributes that can be converted to categorical).
 - Sorting by frequency, alphabetical, natural, or manual order.
 - Palette selection (with scheme preference) and optional max category limits.
@@ -89,7 +91,7 @@ Mapper channels support `transformType` for common pre-transforms (`log`, `log1p
 
 ## Example: Basic demo node colors
 
-The bundled basic example (`docs/examples/basic/main.js`) starts with a serializable node color mapper (`$index` → `CET_L08-NeonBurst` across the full index domain), so the UI doesn’t treat it as a custom preset. Toggle the renderer via `?renderer=webgl` and compare edge transparency modes via `?edgeTransparency=alpha` or another explicit mode to see how visuals react.
+The bundled main app (`docs/app/main.js`) uses Helios internal mapper defaults unless you explicitly change mapper settings through the API or UI. Toggle the renderer via `?renderer=webgl` and compare edge transparency modes via `?edgeTransparency=alpha` or another explicit mode to see how visuals react.
 
 ## When things look flat
 
@@ -97,4 +99,4 @@ The bundled basic example (`docs/examples/basic/main.js`) starts with a serializ
 - Try a diverging map (e.g., `d3:interpolatePiYG`) when you have values centered around zero.
 - Increase size/width ranges if colors alone aren’t perceptible.
 
-For more end-to-end context, see the example README in `docs/examples/basic/README.md`.
+For more end-to-end context, see the example README in `docs/app/README.md`.

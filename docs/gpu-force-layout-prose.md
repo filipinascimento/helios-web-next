@@ -1,4 +1,4 @@
-# Methodology: GPU Force Layout in Helios Web Next
+# Methodology: GPU Force Layout in Helios Web
 
 This document presents the GPU force layout as a methodology section, aligned with the current implementation in `src/layouts/GpuForceLayout.js` and `src/delegates/GpuForcePositionDelegate.js`. The layout is implemented as a position-delegate system in which simulation state is advanced on GPU resources and consumed directly by the renderer, thereby minimizing CPU-GPU transfer in the steady state. WebGPU uses compute buffers; WebGL2 uses float-texture fragment passes when `EXT_color_buffer_float` is available, and otherwise falls back to CPU simulation plus texture upload.
 
@@ -311,7 +311,7 @@ Table 1 lists current defaults from the implementation.
 | `maxStep` | `2.5` | Velocity magnitude cap before `dtScale`. |
 | `minDistance` | `0.15` | Distance floor preventing singular forces. |
 | `alpha` | `1` | Initial cooling multiplier. |
-| `alphaDecay` | `0.005` | Per-tick decay toward `alphaTarget`. |
+| `alphaDecay` | `0.001` | Per-tick decay toward `alphaTarget`. |
 | `alphaTarget` | `0` | Cooling asymptote. |
 | `alphaMin` | `0.001` | Lower bound on cooling factor. |
 | `resetAlphaOnTopologyChange` | `true` | Resets alpha to initial value after topology rebuild. |

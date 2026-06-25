@@ -235,7 +235,6 @@ export function createSliderRow(attribute, options = {}) {
     if (!Number.isFinite(v)) return;
     updateSliderVisual();
     writeSliderValue(v);
-    writeSliderValue.flush();
   });
 
   const commitTypedValue = (eventName) => {

@@ -223,7 +223,7 @@ async function ensureSectionExpanded(panel, title) {
   await expect(subpanel).toHaveAttribute('data-collapsed', 'false');
 }
 
-test.describe('basic example selection panel', () => {
+test.describe('main app selection panel', () => {
   test('selection panel binds to SelectionBehavior instead of owning selection logic', async ({ page }) => {
     await waitForExample(page);
 
@@ -439,7 +439,9 @@ test.describe('basic example selection panel', () => {
 
     await expect.poll(async () => page.evaluate(() => window.__helios.nodeStateStyle?.('SELECTED')?.sizeMul ?? null)).toBeCloseTo(2.1, 1);
 
-    const selectedEdgeOpacityRow = selectedSubpanel.locator('.helios-ui-row:has(.helios-ui-label__title:has-text("Opacity Gain"))').nth(1);
+    const selectedEdgeOpacityRow = selectedSubpanel.locator(
+      '.helios-ui-row[data-helios-selection-style-target="edge"][data-helios-selection-style-property="opacityMul"]',
+    ).first();
     await expect(selectedEdgeOpacityRow).toBeVisible();
     const selectedEdgeOpacityInput = selectedEdgeOpacityRow.locator('input[type="number"]').first();
     const selectedEdgeOpacitySlider = selectedEdgeOpacityRow.locator('input[type="range"]').first();

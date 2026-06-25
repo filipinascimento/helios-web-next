@@ -24,7 +24,41 @@ function parseScreenshot(buffer) {
   });
 }
 
-test.describe('basic example', () => {
+test.describe('main app', () => {
+  test('uses a generated Watts-Strogatz default network', async ({ page }) => {
+    await page.goto('/?renderer=webgl');
+
+    const diagnostics = await waitForDiagnostics(page);
+    expect(diagnostics.error ?? null).toBeNull();
+
+    const syntheticDataset = await page.waitForFunction(() => {
+      const dataset = window.__HELIOS_SYNTHETIC_DATASET__;
+      return dataset?.model === 'watts-strogatz' && dataset.summary ? dataset : null;
+    }, null, { timeout: 60000 }).then((handle) => handle.jsonValue());
+
+    expect(syntheticDataset.name).toBe('small-world');
+    expect(syntheticDataset.summary.nodeCount).toBe(10000);
+    expect(syntheticDataset.neighborLevel).toBe(2);
+    expect(syntheticDataset.rewiringProbability).toBe(0.006);
+  });
+
+  test('keeps the explicit Watts-Strogatz dataset path available', async ({ page }) => {
+    await page.goto('/?renderer=webgl&layout=none&nodes=256&dataset=ws');
+
+    const diagnostics = await waitForDiagnostics(page);
+    expect(diagnostics.error ?? null).toBeNull();
+
+    const syntheticDataset = await page.waitForFunction(() => {
+      const dataset = window.__HELIOS_SYNTHETIC_DATASET__;
+      return dataset?.model === 'watts-strogatz' && dataset.summary ? dataset : null;
+    }, null, { timeout: 60000 }).then((handle) => handle.jsonValue());
+
+    expect(syntheticDataset.name).toBe('small-world');
+    expect(syntheticDataset.summary.nodeCount).toBe(256);
+    expect(syntheticDataset.neighborLevel).toBe(2);
+    expect(syntheticDataset.rewiringProbability).toBe(0.006);
+  });
+
   test('renders nodes with non-empty pixels', async ({ page }) => {
     await page.goto('/tests/fixtures/demo.html?renderer=webgl&nodes=600');
 

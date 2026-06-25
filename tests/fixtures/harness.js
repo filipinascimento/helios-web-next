@@ -241,6 +241,7 @@ export async function bootstrapDemoFixture() {
     const mappersUi = resolveMappersUi(params);
     const dataset = resolveDataset(params);
     const rendererPreference = resolveRendererPreference(params);
+    const fileDrop = params.get('fileDrop') === '1';
 
     const container = document.getElementById('app');
     const network = await HeliosNetwork.create({ directed: false, initialNodes: 0 });
@@ -298,6 +299,7 @@ export async function bootstrapDemoFixture() {
       mode,
       clearColor: [0, 0, 0, 1],
       projection: 'perspective',
+      fileDrop,
       layout: layoutType === 'none'
         ? { type: 'static', options: { bounds: [-500, -500, 500, 500] } }
         : layoutType === 'gpuforce'
@@ -355,8 +357,10 @@ export async function bootstrapDemoFixture() {
     await helios.ready;
 
     if (mappersUi) {
-      const heliosUI = new HeliosUI({ helios, theme: 'dark', allowDrag: false });
-      heliosUI.createMappersPanel({ dock: 'top-left', position: { x: 8, y: 8 } });
+      const heliosUI = helios.ui ?? new HeliosUI({ helios, theme: 'dark', allowDrag: false, layerName: 'mappers-ui' });
+      if (!document.querySelector('.helios-ui-panel[data-panel-id="helios-ui-mappers"]')) {
+        heliosUI.createMappersPanel({ dock: 'top-left', position: { x: 8, y: 8 } });
+      }
       window.__heliosUI = heliosUI;
     }
 
